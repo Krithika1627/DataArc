@@ -1,0 +1,7 @@
+age,name,salary,department
+25,Alice,50000,Engineering
+30,Bob,60000,Marketing
+35,Charlie,70000,Engineering
+,Diana,,Engineering
+40,,80000,HR
+25,Alice,50000,Engineering
