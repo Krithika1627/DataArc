@@ -6,9 +6,10 @@ from typing import TypedDict
 import pandas as pd
 from dotenv import load_dotenv
 
+from agents.logging_utils import with_agent_logging
 
+@with_agent_logging("dataset_profiling")
 def profile_dataset(df: pd.DataFrame) -> dict:
-    """Profile a DataFrame: row/column counts, per-column stats, duplicates."""
     if len(df.columns) == 0:
         return {
             "row_count": 0,
@@ -44,6 +45,7 @@ def profile_dataset(df: pd.DataFrame) -> dict:
     }
 
 
+@with_agent_logging("target_detection")
 def detect_target_candidates(df: pd.DataFrame, return_all: bool = False) -> list[dict]:
     target_keywords = {"target", "label", "class", "y", "outcome", "result"}
     outcome_keywords = {"score", "price", "amount", "value", "rating", "revenue", "salary", "cost"}
@@ -157,6 +159,7 @@ def _build_classify_prompt(profile: dict, target_candidates: list[dict]) -> str:
     return "\n".join(lines)
 
 
+@with_agent_logging("problem_type_classification")
 def classify_problem_type(profile: dict, target_candidates: list[dict]) -> dict:
     fallback = {
         "problem_type": "unclear",
@@ -187,7 +190,7 @@ def classify_problem_type(profile: dict, target_candidates: list[dict]) -> dict:
     prompt = _build_classify_prompt(profile, target_candidates)
 
     try:
-        model = genai.GenerativeModel("gemini-flash-latest")
+        model = genai.GenerativeModel("gemini-3.1-flash-lite")
         response = model.generate_content(
             prompt,
             generation_config=genai.types.GenerationConfig(
