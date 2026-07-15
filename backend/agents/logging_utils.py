@@ -87,6 +87,12 @@ def _summarise_output(value: object) -> dict:
         return {"type": "list", "length": len(value), "first_item_preview": preview}
     if isinstance(value, pd.DataFrame):
         return {"type": "DataFrame", "shape": [int(s) for s in value.shape]}
+    if isinstance(value, tuple):
+        return {
+            "type": "tuple",
+            "length": len(value),
+            "elements": [_summarise_output(item) for item in value],
+        }
     return {"type": type(value).__name__, "repr": repr(value)[:120]}
 
 def with_agent_logging(agent_name: str):

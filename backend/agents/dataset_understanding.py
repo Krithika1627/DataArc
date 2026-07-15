@@ -6,7 +6,7 @@ from typing import TypedDict
 import pandas as pd
 from dotenv import load_dotenv
 
-from agents.logging_utils import with_agent_logging
+from logging_utils import with_agent_logging
 
 @with_agent_logging("dataset_profiling")
 def profile_dataset(df: pd.DataFrame) -> dict:
