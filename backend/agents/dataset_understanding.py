@@ -180,9 +180,9 @@ def classify_problem_type(profile: dict, target_candidates: list[dict]) -> dict:
         return fallback
 
     try:
-        import google.generativeai as genai
+        from google import genai
 
-        genai.configure(api_key=api_key)
+        client = genai.Client(api_key=api_key)
     except Exception as exc:
         fallback["confidence_reasoning"] = f"LLM classification unavailable: failed to configure Gemini SDK: {exc}"
         return fallback
@@ -190,13 +190,13 @@ def classify_problem_type(profile: dict, target_candidates: list[dict]) -> dict:
     prompt = _build_classify_prompt(profile, target_candidates)
 
     try:
-        model = genai.GenerativeModel("gemini-3.1-flash-lite")
-        response = model.generate_content(
-            prompt,
-            generation_config=genai.types.GenerationConfig(
-                response_mime_type="application/json",
-                response_schema=_ProblemTypeResponse,
-            ),
+        response = client.models.generate_content(
+            model="gemini-3.1-flash-lite",
+            contents=prompt,
+            config={
+                "response_mime_type": "application/json",
+                "response_schema": _ProblemTypeResponse,
+            },
         )
 
         import json as json_module

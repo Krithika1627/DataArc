@@ -125,11 +125,11 @@ class TestClassifyProblemType:
         )
 
         with unittest.mock.patch(
-            "google.generativeai.GenerativeModel"
-        ) as mock_model_class:
-            mock_instance = unittest.mock.MagicMock()
-            mock_instance.generate_content.return_value = mock_response
-            mock_model_class.return_value = mock_instance
+            "google.genai.Client"
+        ) as mock_client_class:
+            mock_client = unittest.mock.MagicMock()
+            mock_client.models.generate_content.return_value = mock_response
+            mock_client_class.return_value = mock_client
 
             profile = profile_dataset(obvious_target_df)
             candidates = detect_target_candidates(obvious_target_df)
@@ -152,17 +152,11 @@ class TestClassifyProblemType:
         )
 
     def test_classify_garbage_api_key(self, obvious_target_df):
-        import google.generativeai as genai
-
         profile = profile_dataset(obvious_target_df)
         candidates = detect_target_candidates(obvious_target_df)
 
         real_key = os.environ.get("GEMINI_API_KEY")
         os.environ["GEMINI_API_KEY"] = "INVALID_KEY_THAT_WILL_FAIL"
-        try:
-            genai.configure(api_key="INVALID_KEY_THAT_WILL_FAIL")
-        except Exception:
-            pass
 
         try:
             result = classify_problem_type(profile, candidates)
