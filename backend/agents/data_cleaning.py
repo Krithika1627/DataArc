@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 import pandas as pd
 
@@ -232,6 +233,122 @@ def handle_outliers(
     return result_df, summary
 
 
+@with_agent_logging("dtype_fixing")
+def fix_dtypes(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    result_df = df.copy()
+
+    columns_fixed: list[dict] = []
+    columns_left_as_object: list[str] = []
+
+    artifact_map: dict[str, str] = {
+        "$": "$",
+        ",": ",",
+        "%": "%",
+        "\u20b9": "\u20b9",  # Indian Rupee
+        "\u20ac": "\u20ac",  # Euro
+    }
+
+    known_units: list[str] = [
+        "cm", "mm", "km", "m",
+        "in", "ft",
+        "kg", "lbs", "lb", "g",
+    ]
+
+    for col in result_df.columns:
+        dtype = str(result_df[col].dtype)
+        if dtype != "object":
+            continue
+
+        non_null_values = result_df[col].dropna()
+        total_non_null = len(non_null_values)
+
+        if total_non_null == 0:
+            # All-null object column - leave as object
+            columns_left_as_object.append(str(col))
+            continue
+
+        # Detect which artifacts are present in this column
+        detected_artifacts: list[str] = []
+        for artifact_key, artifact_char in artifact_map.items():
+            if non_null_values.astype(str).str.contains(
+                re.escape(artifact_char), na=False, regex=True
+            ).any():
+                detected_artifacts.append(artifact_key)
+
+        # Detect consistent unit suffixes 
+        detected_unit: str | None = None
+        for unit in known_units:
+            unit_match_count = (
+                non_null_values.astype(str)
+                .str.lower()
+                .str.strip()
+                .str.endswith(unit.lower())
+                .sum()
+            )
+            if unit_match_count / total_non_null >= 0.95:
+                detected_unit = unit
+                break
+
+        def clean_value(v: str) -> str:
+            cleaned = v.strip()
+            for _, artifact_char in artifact_map.items():
+                cleaned = cleaned.replace(artifact_char, "")
+            if detected_unit is not None:
+                if cleaned.lower().endswith(detected_unit.lower()):
+                    cleaned = cleaned[:-len(detected_unit)]
+            return cleaned.strip()
+
+        sample_cleaned = non_null_values.astype(str).apply(clean_value)
+
+        converted_sample = pd.to_numeric(sample_cleaned, errors="coerce")
+        successful_conversions = converted_sample.notna().sum()
+
+        conversion_rate = successful_conversions / total_non_null
+
+        if conversion_rate >= 0.95:
+            full_cleaned = result_df[col].astype(str).apply(clean_value)
+
+            result_df[col] = pd.to_numeric(full_cleaned, errors="coerce").astype("float64")
+
+            final_non_null = int(result_df[col].notna().sum())
+            values_coerced_to_nan = total_non_null - final_non_null
+
+            entry: dict = {
+                "column": str(col),
+                "original_dtype": "object",
+                "new_dtype": str(result_df[col].dtype),
+                "values_converted": final_non_null,
+                "values_coerced_to_nan": values_coerced_to_nan,
+                "artifacts_stripped": detected_artifacts,
+            }
+
+            if detected_unit is not None:
+                col_lower = str(col).lower()
+                unit_lower = detected_unit.lower()
+                already_has_unit = (
+                    col_lower.endswith(f"_{unit_lower}")
+                )
+                if not already_has_unit:
+                    new_col_name = f"{col}_{detected_unit}"
+                    result_df.rename(columns={col: new_col_name}, inplace=True)
+                    entry["renamed_from"] = str(col)
+                    entry["renamed_to"] = new_col_name
+                    entry["unit_detected"] = detected_unit
+                else:
+                    entry["unit_detected"] = detected_unit
+
+            columns_fixed.append(entry)
+        else:
+            columns_left_as_object.append(str(col))
+
+    summary = {
+        "columns_fixed": columns_fixed,
+        "columns_left_as_object": columns_left_as_object,
+    }
+
+    return result_df, summary
+
+
 @with_agent_logging("cleaning_orchestration")
 def clean_dataset_stage_1(
     df: pd.DataFrame,
@@ -241,7 +358,9 @@ def clean_dataset_stage_1(
 ) -> dict:
     deduped_df, dup_summary = remove_duplicates(df)
 
-    imputed_df, impute_summary = impute_missing_values(deduped_df)
+    dtyped_df, dtype_summary = fix_dtypes(deduped_df)
+
+    imputed_df, impute_summary = impute_missing_values(dtyped_df)
 
     cleaned_df, outlier_summary = handle_outliers(
         imputed_df,
@@ -251,6 +370,7 @@ def clean_dataset_stage_1(
 
     combined_summary = {
         "duplicate_removal": dup_summary,
+        "dtype_fixing": dtype_summary,
         "missing_value_imputation": impute_summary,
         "outlier_handling": outlier_summary,
     }

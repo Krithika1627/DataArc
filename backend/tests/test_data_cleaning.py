@@ -8,6 +8,7 @@ import pytest
 
 from agents.data_cleaning import (
     clean_dataset_stage_1,
+    fix_dtypes,
     handle_outliers,
     impute_missing_values,
     remove_duplicates,
@@ -268,3 +269,165 @@ class TestCleaningOrchestration:
         assert path.endswith("test_stage_v1.csv")
         loaded = pd.read_csv(path)
         assert len(loaded) == 3
+
+
+class TestDtypeFixing:
+    def test_unit_height_column_renamed_to_height_cm(self, height_unit_df: pd.DataFrame):
+        """Unit-suffixed column gets detected, converted, and renamed."""
+        fixed_df, summary = fix_dtypes(height_unit_df)
+
+        assert len(summary["columns_fixed"]) == 1
+        entry = summary["columns_fixed"][0]
+        assert entry["column"] == "Height"  # original name before rename
+        assert entry["original_dtype"] == "object"
+        assert entry["new_dtype"] == "float64"
+        assert entry["values_converted"] == 10
+        assert entry["values_coerced_to_nan"] == 0
+        assert entry["unit_detected"] == "cm"
+        assert entry["renamed_from"] == "Height"
+        assert entry["renamed_to"] == "Height_cm"
+
+        # Column should be renamed in the DataFrame
+        assert "Height_cm" in fixed_df.columns
+        assert "Height" not in fixed_df.columns
+
+        # Values should be numeric
+        assert fixed_df["Height_cm"].dtype == "float64"
+        assert fixed_df["Height_cm"].iloc[0] == 180.0
+        assert fixed_df["Height_cm"].iloc[1] == 165.0
+
+        # City column should remain untouched
+        assert fixed_df["city"].dtype == "object"
+
+    def test_unit_weight_already_named_not_double_renamed(self, weight_already_named_df: pd.DataFrame):
+        """Column already named with unit suffix is NOT double-renamed."""
+        fixed_df, summary = fix_dtypes(weight_already_named_df)
+
+        assert len(summary["columns_fixed"]) == 1
+        entry = summary["columns_fixed"][0]
+        assert entry["column"] == "Weight_kg"
+        assert entry["unit_detected"] == "kg"
+        # No renamed_from/renamed_to since column already had the unit
+        assert "renamed_from" not in entry
+        assert "renamed_to" not in entry
+
+        # Column should keep its name, not become "Weight_kg_kg"
+        assert "Weight_kg" in fixed_df.columns
+
+        # Values should be numeric
+        assert fixed_df["Weight_kg"].dtype == "float64"
+        assert fixed_df["Weight_kg"].iloc[0] == 70.0
+        assert fixed_df["Weight_kg"].iloc[1] == 65.0
+
+    def test_mixed_units_not_renamed(self, mixed_units_df: pd.DataFrame):
+        """Column with mixed/inconsistent units is left as object."""
+        fixed_df, summary = fix_dtypes(mixed_units_df)
+
+        # 6 values end in "cm", 4 in "in" -> 60% for "cm", below 95% threshold
+        # So no unit should be detected, and the conversion will fail because
+        # stripping only artifacts ($, comma, %) leaves the unit suffixes on,
+        # so pd.to_numeric won't convert them
+        assert len(summary["columns_fixed"]) == 0
+        assert "measurement" in summary["columns_left_as_object"]
+
+        # Column should remain object dtype
+        assert fixed_df["measurement"].dtype == "object"
+
+    def test_currency_column_converted_correctly(self, currency_df: pd.DataFrame):
+        """Currency-formatted column gets correctly detected and converted to float64."""
+        fixed_df, summary = fix_dtypes(currency_df)
+
+        assert len(summary["columns_fixed"]) == 1
+        entry = summary["columns_fixed"][0]
+        assert entry["column"] == "price_str"
+        assert entry["original_dtype"] == "object"
+        assert entry["new_dtype"] == "float64"
+        assert entry["values_converted"] == 10
+        assert entry["values_coerced_to_nan"] == 0
+        assert "$" in entry["artifacts_stripped"]
+        assert "," in entry["artifacts_stripped"]
+
+        # Verify correct numeric values
+        assert fixed_df["price_str"].dtype == "float64"
+        assert fixed_df["price_str"].iloc[0] == 1200.0
+        assert fixed_df["price_str"].iloc[1] == 950.0
+
+    def test_percent_column_converted_correctly(self, percent_df: pd.DataFrame):
+        """Percent-formatted column gets correctly detected and converted."""
+        fixed_df, summary = fix_dtypes(percent_df)
+
+        assert len(summary["columns_fixed"]) == 1
+        entry = summary["columns_fixed"][0]
+        assert entry["column"] == "pct_str"
+        assert entry["original_dtype"] == "object"
+        assert entry["new_dtype"] == "float64"
+        assert entry["values_converted"] == 10
+        assert entry["values_coerced_to_nan"] == 0
+        assert "%" in entry["artifacts_stripped"]
+
+        # Verify correct numeric values (e.g. "45%" -> 45.0)
+        assert fixed_df["pct_str"].iloc[0] == 45.0
+        assert fixed_df["pct_str"].iloc[1] == 62.0
+
+    def test_categorical_column_left_untouched(self, categorical_df: pd.DataFrame):
+        """Genuinely categorical column is left as object and appears in columns_left_as_object."""
+        fixed_df, summary = fix_dtypes(categorical_df)
+
+        assert len(summary["columns_fixed"]) == 0
+        assert "region" in summary["columns_left_as_object"]
+        assert "code" in summary["columns_left_as_object"]
+
+        # Both columns should still be object dtype
+        assert fixed_df["region"].dtype == "object"
+        assert fixed_df["code"].dtype == "object"
+
+    def test_mixed_conversion_reports_coerced_to_nan(self, mixed_conversion_df: pd.DataFrame):
+        """Column with some unconvertible values correctly reports values_coerced_to_nan."""
+        fixed_df, summary = fix_dtypes(mixed_conversion_df)
+
+        assert len(summary["columns_fixed"]) == 1
+        entry = summary["columns_fixed"][0]
+        assert entry["column"] == "amount_str"
+        assert entry["values_converted"] == 19  # 19 of 20 values converted
+        assert entry["values_coerced_to_nan"] == 1  # "unknown" became NaN
+
+        # The "unknown" value should be NaN (it's the last entry)
+        assert pd.isna(fixed_df["amount_str"].iloc[19])
+
+        # Other values should be correct
+        assert fixed_df["amount_str"].iloc[0] == 1200.0
+        assert fixed_df["amount_str"].iloc[1] == 950.0
+
+    def test_short_unit_no_false_positive_on_word_ending(self, rating_grams_df: pd.DataFrame):
+        """A column whose name coincidentally ends in a unit letter (e.g.
+        'Rating' ending in 'g') should still get correctly renamed to
+        Rating_g, not skipped due to a false 'already has unit' match."""
+        fixed_df, summary = fix_dtypes(rating_grams_df)
+
+        entry = summary["columns_fixed"][0]
+        assert entry["column"] == "Rating"
+        assert entry["unit_detected"] == "g"
+        assert entry["renamed_from"] == "Rating"
+        assert entry["renamed_to"] == "Rating_g"
+        assert "Rating_g" in fixed_df.columns
+
+    def test_all_four_stages_end_to_end(self, tmp_path, full_pipeline_df: pd.DataFrame):
+        """Full 4-stage orchestration works end-to-end with a dataset needing all steps."""
+        result = clean_dataset_stage_1(full_pipeline_df, artifacts_dir=str(tmp_path))
+
+        summary = result["summary"]
+        assert "duplicate_removal" in summary
+        assert "dtype_fixing" in summary
+        assert "missing_value_imputation" in summary
+        assert "outlier_handling" in summary
+
+        saved_artifact = pd.read_csv(result["artifact_path"])
+        with open(result["changelog_path"]) as f:
+            saved_changelog = json.load(f)
+
+        assert len(saved_artifact) > 0
+        assert saved_changelog == summary
+
+        assert saved_artifact["price_str"].dtype == "float64"
+
+        assert len(saved_artifact) == 9
