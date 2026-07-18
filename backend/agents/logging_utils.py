@@ -126,31 +126,3 @@ def with_agent_logging(agent_name: str):
         return wrapper
 
     return decorator
-
-
-if __name__ == "__main__":
-
-    @with_agent_logging("dummy_agent")
-    def dummy_success(value: int) -> dict:
-        """Test function that succeeds."""
-        return {"value": value, "squared": value * value}
-
-    @with_agent_logging("dummy_agent")
-    def dummy_fail(value: int) -> dict:
-        """Test function that raises an exception."""
-        raise RuntimeError(f"Simulated failure for input {value}")
-
-    print("--- Test 1: successful run ---")
-    result = dummy_success(42)
-    print(f"Returned: {result}")
-
-    print("\n--- Test 2: failing run ---")
-    try:
-        dummy_fail(99)
-    except RuntimeError as exc:
-        print(f"Caught expected exception: {exc}")
-
-    print("\n--- Log file contents ---")
-    with open("logs/agent_runs.log") as f:
-        for line in f:
-            print(line.rstrip())
