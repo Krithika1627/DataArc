@@ -132,18 +132,127 @@ def impute_missing_values(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     return result_df, summary
 
 
+@with_agent_logging("outlier_handling")
+def handle_outliers(
+    df: pd.DataFrame,
+    target_column: str | None = None,
+    cap_target: bool = False,
+) -> tuple[pd.DataFrame, dict]:
+    """Detect and cap outliers in numeric columns using the IQR method."""
+    result_df = df.copy()
+    total_rows = len(result_df)
+
+    columns_processed: list[dict] = []
+    columns_skipped_low_cardinality: list[dict] = []
+    columns_skipped_target_protected: list[dict] = []
+
+    for col in result_df.columns:
+        dtype = str(result_df[col].dtype)
+
+        if dtype not in ("int64", "float64"):
+            continue
+
+        # Target column protection: skip if target is identified and user hasn't opted in
+        if target_column is not None and str(col) == target_column and not cap_target:
+            columns_skipped_target_protected.append(
+                {
+                    "column": str(col),
+                    "reason": "target_column_protected_by_default",
+                }
+            )
+            continue
+
+        unique_count = result_df[col].nunique()
+        col_data = result_df[col]
+
+        # low cardinality (categorical-in-disguise)
+        if unique_count <= 5:
+            columns_skipped_low_cardinality.append(
+                {"column": str(col), "reason": "low_cardinality"}
+            )
+            continue
+
+        # bounded count variable (discrete counts with limited range)
+        is_non_negative = (col_data >= 0).all()
+        is_whole_numbers = (col_data == col_data.round()).all()
+        if is_non_negative and is_whole_numbers and unique_count <= 20:
+            columns_skipped_low_cardinality.append(
+                {"column": str(col), "reason": "bounded_count_variable"}
+            )
+            continue
+
+        result_df[col] = result_df[col].astype("float64")
+
+        q1 = float(result_df[col].quantile(0.25))
+        q3 = float(result_df[col].quantile(0.75))
+        iqr = q3 - q1
+
+        lower_bound = q1 - 1.5 * iqr
+        upper_bound = q3 + 1.5 * iqr
+
+        # Identify outliers
+        below_mask = result_df[col] < lower_bound
+        above_mask = result_df[col] > upper_bound
+        outliers_mask = below_mask | above_mask
+        outliers_capped_count = int(outliers_mask.sum())
+
+        if outliers_capped_count == 0:
+            continue
+
+        outliers_capped_percentage = round(
+            (outliers_capped_count / total_rows) * 100, 2
+        )
+
+        result_df.loc[below_mask, col] = lower_bound
+        result_df.loc[above_mask, col] = upper_bound
+
+        entry: dict = {
+            "column": str(col),
+            "q1": q1,
+            "q3": q3,
+            "iqr": iqr,
+            "lower_bound": lower_bound,
+            "upper_bound": upper_bound,
+            "outliers_capped_count": outliers_capped_count,
+            "outliers_capped_percentage": outliers_capped_percentage,
+        }
+
+        # If the target column was explicitly opted in, note it in the entry
+        if target_column is not None and str(col) == target_column and cap_target:
+            entry["is_target"] = True
+
+        columns_processed.append(entry)
+
+    summary = {
+        "columns_processed": columns_processed,
+        "columns_skipped_low_cardinality": columns_skipped_low_cardinality,
+        "columns_skipped_target_protected": columns_skipped_target_protected,
+    }
+
+    return result_df, summary
+
+
 @with_agent_logging("cleaning_orchestration")
 def clean_dataset_stage_1(
     df: pd.DataFrame,
     artifacts_dir: str = "artifacts",
+    target_column: str | None = None,
+    cap_target: bool = False,
 ) -> dict:
     deduped_df, dup_summary = remove_duplicates(df)
 
-    cleaned_df, impute_summary = impute_missing_values(deduped_df)
+    imputed_df, impute_summary = impute_missing_values(deduped_df)
+
+    cleaned_df, outlier_summary = handle_outliers(
+        imputed_df,
+        target_column=target_column,
+        cap_target=cap_target,
+    )
 
     combined_summary = {
         "duplicate_removal": dup_summary,
         "missing_value_imputation": impute_summary,
+        "outlier_handling": outlier_summary,
     }
 
     artifact_path = save_versioned_artifact(
@@ -167,7 +276,6 @@ if __name__ == "__main__":
     import tempfile
 
     print("PART 1: Duplicate removal test")
-
     # Create a synthetic DataFrame with seeded duplicates.
     # Total duplicates = 3.
     dup_synthetic = pd.DataFrame(
@@ -334,5 +442,240 @@ if __name__ == "__main__":
             "Saved changelog JSON does not match returned summary"
         )
         print("Saved changelog JSON matches returned summary")
+
+    print("\nPART 2 passed.\n")
+
+    print("PART 3: Outlier handling test (revised)")
+
+    import warnings
+
+    outlier_synthetic = pd.DataFrame(
+        {
+            "col_outliers": [
+                15.0, 20.0, 18.0, 22.0, 14.0,
+                16.0, 19.0, 21.0, 17.0, 23.0,
+                500.0, -200.0, 13.0, 25.0,
+            ],
+            "is_active": [1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0],
+            "col_symmetric": [
+                10.0, 12.0, 11.0, 13.0, 9.0,
+                11.0, 10.0, 10.0, 12.0, 11.0,
+                10.0, 13.0, 11.5, 12.5,
+            ],
+            "tutoring_sessions": [
+                0, 1, 0, 2, 1, 3, 0, 2, 4, 1,
+                0, 3, 2, 5,
+            ],
+        }
+    )
+
+    total_rows = len(outlier_synthetic)
+    print(f"\nSynthetic outlier DataFrame: {total_rows} rows")
+    print(
+        "  col_outliers       — float64, values 10-25 range + extreme outliers 500, -200\n"
+        "  is_active          — int64,   0/1 flag (low cardinality, should be skipped)\n"
+        "  col_symmetric      — float64, no outliers (values in 9-13 range)\n"
+        "  tutoring_sessions  — int64,   0-5 range, whole nums <=20 unique (bounded count, should be skipped)\n"
+    )
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            result_stage = clean_dataset_stage_1(outlier_synthetic, artifacts_dir=tmp_dir)
+
+        print("\nCombined summary")
+        print(json.dumps(result_stage["summary"], indent=2, default=str))
+
+        cleaned_df = pd.read_csv(result_stage["artifact_path"])
+
+        summary = result_stage["summary"]
+        outlier_summary = summary["outlier_handling"]
+
+        # col_outliers (genuine outliers, should be processed)
+        outlier_entry = next(
+            c for c in outlier_summary["columns_processed"]
+            if c["column"] == "col_outliers"
+        )
+        print(f"\ncol_outliers: q1={outlier_entry['q1']}, q3={outlier_entry['q3']}, "
+              f"iqr={outlier_entry['iqr']}")
+        print(f"  lower_bound={outlier_entry['lower_bound']}, "
+              f"upper_bound={outlier_entry['upper_bound']}")
+        print(f"  capped {outlier_entry['outliers_capped_count']} "
+              f"({outlier_entry['outliers_capped_percentage']}%) outliers")
+
+        # Check the extreme values are no longer present
+        assert 500.0 not in cleaned_df["col_outliers"].values, (
+            "500 should have been capped"
+        )
+        assert -200.0 not in cleaned_df["col_outliers"].values, (
+            "-200 should have been capped"
+        )
+        print("Extreme values 500 and -200 removed via capping — PASSED")
+
+        # Check they were capped to bounds, not dropped (row count preserved)
+        assert len(cleaned_df) == total_rows, (
+            f"Row count changed: {len(cleaned_df)} vs {total_rows}"
+        )
+        print(f"Row count preserved ({len(cleaned_df)} rows) — PASSED")
+
+        # Check capped values respect bounds
+        col_data = cleaned_df["col_outliers"]
+        lb = outlier_entry["lower_bound"]
+        ub = outlier_entry["upper_bound"]
+        assert col_data.min() >= lb, (
+            f"Min value {col_data.min()} is below lower bound {lb}"
+        )
+        assert col_data.max() <= ub, (
+            f"Max value {col_data.max()} is above upper bound {ub}"
+        )
+        print("All values within [lower_bound, upper_bound] — PASSED")
+
+        # is_active (low cardinality skip) 
+        is_active_skip = next(
+            c for c in outlier_summary["columns_skipped_low_cardinality"]
+            if c["column"] == "is_active"
+        )
+        assert is_active_skip["reason"] == "low_cardinality", (
+            f"Expected reason 'low_cardinality' for is_active, got '{is_active_skip['reason']}'"
+        )
+        print("is_active correctly skipped with reason='low_cardinality' — PASSED")
+
+        # Verify is_active values were untouched (still exactly 0 and 1)
+        actual_values = set(cleaned_df["is_active"].unique())
+        assert actual_values == {0, 1}, (
+            f"is_active values changed: {actual_values}"
+        )
+        print("is_active values unchanged (still 0 and 1) — PASSED")
+
+        #tutoring_sessions (bounded count variable skip) 
+        tutoring_skip = next(
+            c for c in outlier_summary["columns_skipped_low_cardinality"]
+            if c["column"] == "tutoring_sessions"
+        )
+        assert tutoring_skip["reason"] == "bounded_count_variable", (
+            f"Expected reason 'bounded_count_variable' for tutoring_sessions, "
+            f"got '{tutoring_skip['reason']}'"
+        )
+        print("tutoring_sessions correctly skipped with reason='bounded_count_variable' — PASSED")
+
+        assert set(cleaned_df["tutoring_sessions"].unique()) == {0, 1, 2, 3, 4, 5}, (
+            "tutoring_sessions values should be unchanged"
+        )
+        print("tutoring_sessions values unchanged — PASSED")
+
+        # col_symmetric (no outliers) 
+        # The column should not appear in columns_processed (no outliers capped)
+        symm_in_processed = any(
+            c["column"] == "col_symmetric"
+            for c in outlier_summary["columns_processed"]
+        )
+        assert not symm_in_processed, (
+            "col_symmetric should not appear in columns_processed (no outliers)"
+        )
+        print("col_symmetric correctly omitted (zero outliers) — PASSED")
+
+        print("\nVerifying saved artifact and changelog")
+        saved_artifact = pd.read_csv(result_stage["artifact_path"])
+        pd.testing.assert_frame_equal(cleaned_df, saved_artifact)
+        print("Saved artifact CSV matches returned DataFrame")
+
+        with open(result_stage["changelog_path"]) as f:
+            saved_changelog = json.load(f)
+        assert saved_changelog == result_stage["summary"], (
+            "Saved changelog JSON does not match returned summary"
+        )
+        print("Saved changelog JSON matches returned summary")
+
+    print("\nTarget column protection tests\n")
+
+    print("Target protection test (a): target protected by default (cap_target=False)")
+    result_a, summary_a = handle_outliers(
+        outlier_synthetic,
+        target_column="col_outliers",
+        cap_target=False,
+    )
+    print(f"  Summary: {json.dumps(summary_a, indent=2, default=str)}")
+
+    target_protected = next(
+        c for c in summary_a["columns_skipped_target_protected"]
+        if c["column"] == "col_outliers"
+    )
+    assert target_protected["reason"] == "target_column_protected_by_default", (
+        f"Expected reason 'target_column_protected_by_default', "
+        f"got '{target_protected['reason']}'"
+    )
+
+    col_in_processed = any(
+        c["column"] == "col_outliers" for c in summary_a["columns_processed"]
+    )
+    assert not col_in_processed, (
+        "col_outliers should not be in columns_processed when target protected"
+    )
+
+    assert 500.0 in result_a["col_outliers"].values, (
+        "500 should still be present when target is protected"
+    )
+    assert -200.0 in result_a["col_outliers"].values, (
+        "-200 should still be present when target is protected"
+    )
+    print("Target protected (cap_target=False) — PASSED\n")
+
+    print("Target protection test (b): target opted in (cap_target=True)")
+    result_b, summary_b = handle_outliers(
+        outlier_synthetic,
+        target_column="col_outliers",
+        cap_target=True,
+    )
+    print(f"  Summary: {json.dumps(summary_b, indent=2, default=str)}")
+
+    target_opted = next(
+        c for c in summary_b["columns_processed"]
+        if c["column"] == "col_outliers"
+    )
+    assert target_opted.get("is_target") is True, (
+        "Expected is_target=True in columns_processed entry"
+    )
+
+    assert 500.0 not in result_b["col_outliers"].values, (
+        "500 should have been capped when target is opted in"
+    )
+    assert -200.0 not in result_b["col_outliers"].values, (
+        "-200 should have been capped when target is opted in"
+    )
+    print("Target opted in (cap_target=True) — PASSED\n")
+
+    print("Target protection test (c): target_column=None (target-agnostic)")
+    result_c, summary_c = handle_outliers(
+        outlier_synthetic,
+        target_column=None,
+    )
+    print(f"  Summary: {json.dumps(summary_c, indent=2, default=str)}")
+
+    assert len(summary_c["columns_skipped_target_protected"]) == 0, (
+        "columns_skipped_target_protected should be empty when target_column=None"
+    )
+
+    col_in_processed_c = any(
+        c["column"] == "col_outliers" for c in summary_c["columns_processed"]
+    )
+    assert col_in_processed_c, (
+        "col_outliers should be processed when target_column=None"
+    )
+
+    outlier_entry_c = next(
+        c for c in summary_c["columns_processed"]
+        if c["column"] == "col_outliers"
+    )
+    assert "is_target" not in outlier_entry_c, (
+        "is_target should not be present when target_column=None"
+    )
+
+    assert 500.0 not in result_c["col_outliers"].values, (
+        "500 should have been capped when target_column=None"
+    )
+    assert -200.0 not in result_c["col_outliers"].values, (
+        "-200 should have been capped when target_column=None"
+    )
+    print("Target-agnostic (target_column=None) — PASSED")
 
     print("\nALL TESTS PASSED")
