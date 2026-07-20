@@ -6,9 +6,12 @@ import warnings
 import pandas as pd
 import pytest
 
+import unittest.mock
+
 from agents.data_cleaning import (
     clean_dataset_stage_1,
     fix_dtypes,
+    generate_cleaning_explanation,
     handle_outliers,
     impute_missing_values,
     remove_duplicates,
@@ -105,7 +108,10 @@ class TestMissingValueImputation:
         pd.testing.assert_frame_equal(
             pd.read_csv(result["artifact_path"]), saved_artifact
         )
-        assert saved_changelog == result["summary"]
+        # Changelog now includes llm_explanation — verify summary matches separately
+        assert saved_changelog["llm_explanation"] == result["explanation"]
+        for key in result["summary"]:
+            assert saved_changelog[key] == result["summary"][key]
 
 # Outlier handling tests 
 
@@ -183,7 +189,10 @@ class TestOutlierHandling:
         pd.testing.assert_frame_equal(
             pd.read_csv(result["artifact_path"]), saved_artifact
         )
-        assert saved_changelog == result["summary"]
+        # Changelog now includes llm_explanation — verify summary matches separately
+        assert saved_changelog["llm_explanation"] == result["explanation"]
+        for key in result["summary"]:
+            assert saved_changelog[key] == result["summary"][key]
 
     def test_no_future_warning_on_int_columns(self, outlier_synthetic: pd.DataFrame):
         with warnings.catch_warnings():
@@ -246,6 +255,177 @@ class TestTargetColumnProtection:
 
         assert 500.0 not in result_df["col_outliers"].values
         assert -200.0 not in result_df["col_outliers"].values
+
+# Cleaning explanation tests
+
+class TestCleaningExplanation:
+    @pytest.mark.llm
+    def test_live_api(self, full_pipeline_df: pd.DataFrame):
+        """Live API test: requires a valid GEMINI_API_KEY environment variable."""
+        result = clean_dataset_stage_1(full_pipeline_df, artifacts_dir="/tmp")
+        explanation = result["explanation"]
+
+        assert "summary" in explanation
+        assert "details" in explanation
+        assert isinstance(explanation["details"], list)
+        assert len(explanation["details"]) > 0
+        assert all(isinstance(d, str) for d in explanation["details"])
+
+    def test_mocked_valid_response(self, monkeypatch):
+        """Mocked test: verify correct parsing of a valid mocked JSON response."""
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key-for-mocking")
+
+        mock_response = unittest.mock.MagicMock()
+        mock_response.text = (
+            '{"summary": "Cleaned the dataset by removing duplicates and imputing missing values.", '
+            '"details": ['
+            '"Removed 3 duplicate rows (2.1% of the dataset).", '
+            '"Imputed 12 missing values in Age using median because the distribution was skewed."'
+            "]}"
+        )
+
+        with unittest.mock.patch("google.genai.Client") as mock_client_class:
+            mock_client = unittest.mock.MagicMock()
+            mock_client.models.generate_content.return_value = mock_response
+            mock_client_class.return_value = mock_client
+
+            changelog = {
+                "duplicate_removal": {
+                    "rows_before": 100,
+                    "rows_after": 97,
+                    "duplicates_removed": 3,
+                    "duplicate_percentage": 3.0,
+                },
+                "missing_value_imputation": {
+                    "columns_imputed": [
+                        {
+                            "column": "Age",
+                            "strategy": "median",
+                            "missing_count": 12,
+                            "missing_percentage": 12.0,
+                            "fill_value": 28.5,
+                            "skew": 2.5,
+                        }
+                    ],
+                    "columns_flagged_high_missing": [],
+                    "columns_skipped_no_missing": [],
+                },
+                "outlier_handling": {
+                    "columns_processed": [],
+                    "columns_skipped_low_cardinality": [],
+                    "columns_skipped_target_protected": [],
+                },
+                "dtype_fixing": {
+                    "columns_fixed": [],
+                    "columns_left_as_object": [],
+                },
+            }
+            result = generate_cleaning_explanation(changelog)
+
+            assert result["summary"] == (
+                "Cleaned the dataset by removing duplicates and imputing missing values."
+            )
+            assert len(result["details"]) == 2
+            assert "duplicate" in result["details"][0].lower()
+            assert "median" in result["details"][1].lower()
+
+    def test_fallback_api_failure(self, monkeypatch):
+        """Fallback test: simulate API failure and confirm fallback dict."""
+        monkeypatch.setenv("GEMINI_API_KEY", "INVALID_KEY_THAT_WILL_FAIL")
+
+        with unittest.mock.patch("google.genai.Client") as mock_client_class:
+            mock_client = unittest.mock.MagicMock()
+            mock_client.models.generate_content.side_effect = Exception(
+                "API call failed: invalid key"
+            )
+            mock_client_class.return_value = mock_client
+
+            changelog = {
+                "duplicate_removal": {"rows_before": 50, "rows_after": 48, "duplicates_removed": 2, "duplicate_percentage": 4.0},
+                "missing_value_imputation": {"columns_imputed": [], "columns_flagged_high_missing": [], "columns_skipped_no_missing": []},
+                "outlier_handling": {"columns_processed": [], "columns_skipped_low_cardinality": [], "columns_skipped_target_protected": []},
+                "dtype_fixing": {"columns_fixed": [], "columns_left_as_object": []},
+            }
+            result = generate_cleaning_explanation(changelog)
+
+            assert "summary" in result
+            assert "details" in result
+            assert "LLM explanation unavailable" in result["summary"]
+            assert "directly" in result["details"][0]
+
+    def test_fallback_no_key(self, monkeypatch):
+        """Fallback when no API key is set."""
+        monkeypatch.setenv("GEMINI_API_KEY", "")
+
+        changelog = {
+            "duplicate_removal": {"rows_before": 50, "rows_after": 50, "duplicates_removed": 0, "duplicate_percentage": 0.0},
+            "missing_value_imputation": {"columns_imputed": [], "columns_flagged_high_missing": [], "columns_skipped_no_missing": []},
+            "outlier_handling": {"columns_processed": [], "columns_skipped_low_cardinality": [], "columns_skipped_target_protected": []},
+            "dtype_fixing": {"columns_fixed": [], "columns_left_as_object": []},
+        }
+        result = generate_cleaning_explanation(changelog)
+
+        assert "summary" in result
+        assert "details" in result
+        assert "GEMINI_API_KEY is not set" in result["summary"]
+
+    def test_empty_changelog_safe(self, monkeypatch):
+        """A changelog with mostly 'nothing happened' stages still returns valid output."""
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key-for-mocking")
+
+        mock_response = unittest.mock.MagicMock()
+        mock_response.text = (
+            '{"summary": "No cleaning was needed for this dataset.", '
+            '"details": ["The dataset was already clean with no issues detected."]}'
+        )
+
+        with unittest.mock.patch("google.genai.Client") as mock_client_class:
+            mock_client = unittest.mock.MagicMock()
+            mock_client.models.generate_content.return_value = mock_response
+            mock_client_class.return_value = mock_client
+
+            changelog = {
+                "duplicate_removal": {"rows_before": 100, "rows_after": 100, "duplicates_removed": 0, "duplicate_percentage": 0.0},
+                "missing_value_imputation": {"columns_imputed": [], "columns_flagged_high_missing": [], "columns_skipped_no_missing": ["col1", "col2"]},
+                "outlier_handling": {"columns_processed": [], "columns_skipped_low_cardinality": [{"column": "is_active", "reason": "low_cardinality"}], "columns_skipped_target_protected": []},
+                "dtype_fixing": {"columns_fixed": [], "columns_left_as_object": ["col1", "col2"]},
+            }
+            result = generate_cleaning_explanation(changelog)
+
+            assert "summary" in result
+            assert isinstance(result["details"], list)
+            # Should still parse successfully even with minimal details
+
+    def test_end_to_end_explanation_key(self, tmp_path, full_pipeline_df: pd.DataFrame, monkeypatch):
+        """End-to-end: orchestration returns explanation key and changelog includes llm_explanation."""
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key-for-mocking")
+
+        mock_response = unittest.mock.MagicMock()
+        mock_response.text = (
+            '{"summary": "Cleaned the dataset by removing duplicates, fixing dtypes, '
+            'imputing missing values, and capping outliers.", '
+            '"details": ["Removed duplicate rows.", "Fixed currency columns.", '
+            '"Imputed missing scores.", "Capped outlier values."]}'
+        )
+
+        with unittest.mock.patch("google.genai.Client") as mock_client_class:
+            mock_client = unittest.mock.MagicMock()
+            mock_client.models.generate_content.return_value = mock_response
+            mock_client_class.return_value = mock_client
+
+            result = clean_dataset_stage_1(full_pipeline_df, artifacts_dir=str(tmp_path))
+
+            assert "explanation" in result
+            assert result["explanation"]["summary"] != ""
+            assert len(result["explanation"]["details"]) > 0
+
+            with open(result["changelog_path"]) as f:
+                saved_changelog = json.load(f)
+
+            assert "llm_explanation" in saved_changelog
+            assert saved_changelog["llm_explanation"]["summary"] == result["explanation"]["summary"]
+            assert saved_changelog["llm_explanation"]["details"] == result["explanation"]["details"]
+
 
 # Orchestration tests 
 
@@ -426,7 +606,9 @@ class TestDtypeFixing:
             saved_changelog = json.load(f)
 
         assert len(saved_artifact) > 0
-        assert saved_changelog == summary
+        assert "llm_explanation" in saved_changelog
+        for key in summary:
+            assert saved_changelog[key] == summary[key]
 
         assert saved_artifact["price_str"].dtype == "float64"
 

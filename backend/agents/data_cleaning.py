@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import os
 import re
+from typing import TypedDict
 
 import pandas as pd
+from dotenv import load_dotenv
 
 from agents.logging_utils import with_agent_logging
 
@@ -44,6 +46,172 @@ def save_versioned_artifact(
     file_path = os.path.join(artifacts_dir, file_name)
     df.to_csv(file_path, index=False)
     return os.path.abspath(file_path)
+
+
+class _CleaningExplanationResponse(TypedDict):
+    summary: str
+    details: list[str]
+
+
+def _build_cleaning_prompt(changelog: dict) -> str:
+    """Build a compact, readable prompt from the structured changelog dict."""
+    lines = [
+        "You are a data scientist explaining what cleaning operations were applied to a dataset.",
+        "Based on the structured changelog below, write a plain-English explanation.",
+        "",
+        "CHANGELOG SUMMARY",
+    ]
+
+    # Duplicate removal
+    dup = changelog.get("duplicate_removal", {})
+    dup_removed = dup.get("duplicates_removed", 0)
+    if dup_removed > 0:
+        lines.append(
+            f"- Duplicates: {dup_removed} duplicates removed "
+            f"out of {dup.get('rows_before', 0)} rows "
+            f"({dup.get('duplicate_percentage', 0)}%)"
+        )
+    else:
+        lines.append("- Duplicates: 0 duplicates removed")
+
+    # Dtype fixing
+    dtype = changelog.get("dtype_fixing", {})
+    fixed_cols = dtype.get("columns_fixed", [])
+    if fixed_cols:
+        for entry in fixed_cols:
+            col = entry.get("column", "?")
+            new_dtype = entry.get("new_dtype", "?")
+            artifacts = entry.get("artifacts_stripped", [])
+            unit = entry.get("unit_detected")
+            coerced = entry.get("values_coerced_to_nan", 0)
+            parts = [f"Column '{col}' converted from object to {new_dtype}"]
+            if artifacts:
+                parts.append(f"artifacts stripped: {', '.join(artifacts)}")
+            if unit:
+                parts.append(f"unit detected: {unit}")
+            if coerced > 0:
+                parts.append(f"{coerced} values coerced to NaN")
+            lines.append(f"- {', '.join(parts)}")
+    else:
+        lines.append("- Dtype fixing: no columns needed conversion")
+
+    # Missing value imputation
+    impute = changelog.get("missing_value_imputation", {})
+    imputed_cols = impute.get("columns_imputed", [])
+    if imputed_cols:
+        for entry in imputed_cols:
+            col = entry.get("column", "?")
+            missing_count = entry.get("missing_count", 0)
+            missing_pct = entry.get("missing_percentage", 0)
+            strategy = entry.get("strategy", "?")
+            fill_value = entry.get("fill_value", "?")
+            skew = entry.get("skew")
+            skew_info = f"skew={skew:.2f}" if skew is not None else "categorical"
+            lines.append(
+                f"- Column '{col}': {missing_count} missing values "
+                f"({missing_pct}%) imputed with {strategy} "
+                f"(fill_value={fill_value}, {skew_info})"
+            )
+    else:
+        lines.append("- Missing value imputation: no columns with missing values to impute")
+
+    flagged = impute.get("columns_flagged_high_missing", [])
+    if flagged:
+        for entry in flagged:
+            lines.append(
+                f"- Column '{entry['column']}': {entry['missing_percentage']}% missing "
+                f"(>50% threshold) \u2014 left untouched"
+            )
+
+    # Outlier handling
+    outlier = changelog.get("outlier_handling", {})
+    processed = outlier.get("columns_processed", [])
+    if processed:
+        for entry in processed:
+            lines.append(
+                f"- Column '{entry['column']}': {entry['outliers_capped_count']} outliers "
+                f"({entry['outliers_capped_percentage']}%) capped at bounds "
+                f"[{entry['lower_bound']}, {entry['upper_bound']}]"
+            )
+    else:
+        lines.append("- Outlier handling: no outliers detected")
+
+    skipped = outlier.get("columns_skipped_target_protected", [])
+    if skipped:
+        for entry in skipped:
+            lines.append(f"- Column '{entry['column']}': skipped (target column protected)")
+
+    lines.append("")
+    lines.append(
+        'Generate a JSON response with:\n'
+        '- "summary": a 2-3 sentence high-level overview of what cleaning was done\n'
+        '- "details": a list of plain-English sentences, one per notable action taken\n'
+        'Only include genuinely notable actions in "details" \u2014 skip narrating non-events '
+        'like "0 duplicates removed" or "no missing values". Focus on what actually changed.'
+    )
+
+    return "\n".join(lines)
+
+
+@with_agent_logging("cleaning_explanation_generation")
+def generate_cleaning_explanation(changelog: dict) -> dict:
+    """Generate a plain-English narrative explanation of the cleaning steps."""
+    fallback = {
+        "summary": "LLM explanation unavailable: ...",
+        "details": [
+            "Please review the structured changelog directly for details of what was cleaned."
+        ],
+    }
+
+    load_dotenv()
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        fallback["summary"] = (
+            "LLM explanation unavailable: GEMINI_API_KEY is not set. "
+            "Create a .env file with GEMINI_API_KEY=your_key or export the variable."
+        )
+        return fallback
+
+    try:
+        from google import genai
+
+        client = genai.Client(api_key=api_key)
+    except Exception as exc:
+        fallback["summary"] = (
+            f"LLM explanation unavailable: failed to configure Gemini SDK: {exc}"
+        )
+        return fallback
+
+    prompt = _build_cleaning_prompt(changelog)
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-3.1-flash-lite",
+            contents=prompt,
+            config={
+                "response_mime_type": "application/json",
+                "response_schema": _CleaningExplanationResponse,
+            },
+        )
+
+        import json as json_module
+
+        result = json_module.loads(response.text)
+
+        required_keys = {"summary", "details"}
+        if not required_keys.issubset(result.keys()):
+            raise ValueError(
+                f"Response missing keys: {required_keys - result.keys()}"
+            )
+
+        if not isinstance(result["details"], list):
+            raise ValueError("details must be a list")
+
+        return result
+
+    except Exception as exc:
+        fallback["summary"] = f"LLM explanation unavailable: {exc}"
+        return fallback
 
 
 @with_agent_logging("missing_value_imputation")
@@ -375,6 +543,8 @@ def clean_dataset_stage_1(
         "outlier_handling": outlier_summary,
     }
 
+    explanation = generate_cleaning_explanation(combined_summary)
+
     artifact_path = save_versioned_artifact(
         cleaned_df, "cleaned", version=1, artifacts_dir=artifacts_dir,
     )
@@ -382,12 +552,16 @@ def clean_dataset_stage_1(
     os.makedirs(artifacts_dir, exist_ok=True)
     changelog_name = "cleaned_v1_changelog.json"
     changelog_path = os.path.join(artifacts_dir, changelog_name)
+
+    changelog_to_save = combined_summary.copy()
+    changelog_to_save["llm_explanation"] = explanation
     with open(changelog_path, "w") as f:
-        json.dump(combined_summary, f, indent=2, default=str)
+        json.dump(changelog_to_save, f, indent=2, default=str)
 
     return {
         "artifact_path": artifact_path,
         "changelog_path": os.path.abspath(changelog_path),
         "summary": combined_summary,
+        "explanation": explanation,
     }
 
