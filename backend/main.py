@@ -1,6 +1,6 @@
 from __future__ import annotations
 import io
-from typing import Optional
+from typing import Any, Optional
 
 import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -10,6 +10,40 @@ from agents.dataset_understanding import (
     detect_target_candidates,
     profile_dataset,
 )
+from agents.data_cleaning import clean_dataset
+
+
+class CleaningSummary(BaseModel):
+    """Summary of all cleaning operations performed on the dataset."""
+    duplicate_removal: dict[str, Any] = Field(
+        description="Duplicate removal results: rows_before, rows_after, duplicates_removed, duplicate_percentage"
+    )
+    missing_value_imputation: dict[str, Any] = Field(
+        description="Missing value imputation results: columns_imputed, columns_flagged_high_missing, columns_skipped_no_missing"
+    )
+    outlier_handling: dict[str, Any] = Field(
+        description="Outlier handling results: columns_processed, columns_skipped_low_cardinality, columns_skipped_target_protected"
+    )
+    dtype_fixing: dict[str, Any] = Field(
+        description="Dtype fixing results: columns_fixed, columns_left_as_object"
+    )
+    llm_explanation: dict[str, Any] = Field(
+        description="LLM-generated plain-English explanation of the cleaning steps"
+    )
+
+
+class CleanDatasetResponse(BaseModel):
+    """Response from the /clean-dataset endpoint."""
+    artifact_path: str = Field(
+        description="Absolute path to the cleaned CSV artifact"
+    )
+    changelog_path: str = Field(
+        description="Absolute path to the changelog JSON file"
+    )
+    summary: CleaningSummary = Field(
+        description="Structured summary of all cleaning operations"
+    )
+
 
 class ColumnProfile(BaseModel):
     """Statistics for a single column."""
@@ -71,6 +105,66 @@ app = FastAPI(
     description="Autonomous data-scientist pipeline – dataset analysis",
     version="0.2.0",
 )
+
+@app.post("/clean-dataset", response_model=CleanDatasetResponse)
+async def clean_dataset_endpoint(
+    file: UploadFile = File(...),
+    target_column: Optional[str] = Form(None),
+    cap_target: bool = Form(False),
+):
+    if not file.filename or not file.filename.lower().endswith(".csv"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type: '{file.filename}'. Only .csv files are accepted.",
+        )
+
+    try:
+        contents = await file.read()
+        df = pd.read_csv(io.BytesIO(contents))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to parse CSV file: {exc}",
+        )
+
+    if len(df) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="CSV has headers but no data rows. Please upload a dataset with at least one row.",
+        )
+
+    if target_column is not None and target_column.strip() == "":
+        target_column = None
+
+    if target_column is not None:
+        if target_column not in df.columns:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Target column '{target_column}' was not found "
+                    f"in the dataset. Available columns: {sorted(str(c) for c in df.columns)}"
+                ),
+            )
+
+    result = clean_dataset(
+        df,
+        target_column=target_column,
+        cap_target=cap_target,
+        artifacts_dir="artifacts",
+    )
+
+    return CleanDatasetResponse(
+        artifact_path=result["artifact_path"],
+        changelog_path=result["changelog_path"],
+        summary=CleaningSummary(
+            duplicate_removal=result["summary"]["duplicate_removal"],
+            missing_value_imputation=result["summary"]["missing_value_imputation"],
+            outlier_handling=result["summary"]["outlier_handling"],
+            dtype_fixing=result["summary"]["dtype_fixing"],
+            llm_explanation=result["explanation"],
+        ),
+    )
+
 
 @app.post("/profile-dataset", response_model=DatasetProfile)
 async def profile_dataset_endpoint(file: UploadFile = File(...)):

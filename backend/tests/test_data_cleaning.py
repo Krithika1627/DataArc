@@ -9,7 +9,7 @@ import pytest
 import unittest.mock
 
 from agents.data_cleaning import (
-    clean_dataset_stage_1,
+    clean_dataset,
     fix_dtypes,
     generate_cleaning_explanation,
     handle_outliers,
@@ -38,7 +38,7 @@ class TestDuplicateRemoval:
         expected_dupes = rows_before - len(unique_rows)
         expected_rows = rows_before - expected_dupes
 
-        result = clean_dataset_stage_1(dup_synthetic, artifacts_dir=str(tmp_path))
+        result = clean_dataset(dup_synthetic, artifacts_dir=str(tmp_path))
 
         saved_df = pd.read_csv(result["artifact_path"])
         assert len(saved_df) == expected_rows
@@ -48,7 +48,7 @@ class TestDuplicateRemoval:
         expected_dupes = rows_before - len(dup_synthetic.drop_duplicates())
         expected_rows = rows_before - expected_dupes
 
-        result = clean_dataset_stage_1(dup_synthetic, artifacts_dir=str(tmp_path))
+        result = clean_dataset(dup_synthetic, artifacts_dir=str(tmp_path))
 
         with open(result["changelog_path"]) as f:
             changelog = json.load(f)
@@ -99,7 +99,7 @@ class TestMissingValueImputation:
         assert imputed_df["col_high_miss"].isna().sum() > 0
 
     def test_impute_file_roundtrip(self, tmp_path, impute_synthetic: pd.DataFrame):
-        result = clean_dataset_stage_1(impute_synthetic, artifacts_dir=str(tmp_path))
+        result = clean_dataset(impute_synthetic, artifacts_dir=str(tmp_path))
 
         saved_artifact = pd.read_csv(result["artifact_path"])
         with open(result["changelog_path"]) as f:
@@ -180,7 +180,7 @@ class TestOutlierHandling:
     def test_outlier_file_roundtrip(self, tmp_path, outlier_synthetic: pd.DataFrame):
         with warnings.catch_warnings():
             warnings.simplefilter("error")
-            result = clean_dataset_stage_1(outlier_synthetic, artifacts_dir=str(tmp_path))
+            result = clean_dataset(outlier_synthetic, artifacts_dir=str(tmp_path))
 
         saved_artifact = pd.read_csv(result["artifact_path"])
         with open(result["changelog_path"]) as f:
@@ -262,7 +262,7 @@ class TestCleaningExplanation:
     @pytest.mark.llm
     def test_live_api(self, full_pipeline_df: pd.DataFrame):
         """Live API test: requires a valid GEMINI_API_KEY environment variable."""
-        result = clean_dataset_stage_1(full_pipeline_df, artifacts_dir="/tmp")
+        result = clean_dataset(full_pipeline_df, artifacts_dir="/tmp")
         explanation = result["explanation"]
 
         assert "summary" in explanation
@@ -413,7 +413,7 @@ class TestCleaningExplanation:
             mock_client.models.generate_content.return_value = mock_response
             mock_client_class.return_value = mock_client
 
-            result = clean_dataset_stage_1(full_pipeline_df, artifacts_dir=str(tmp_path))
+            result = clean_dataset(full_pipeline_df, artifacts_dir=str(tmp_path))
 
             assert "explanation" in result
             assert result["explanation"]["summary"] != ""
@@ -431,7 +431,7 @@ class TestCleaningExplanation:
 
 class TestCleaningOrchestration:
     def test_orchestration_returns_expected_keys(self, tmp_path, dup_synthetic: pd.DataFrame):
-        result = clean_dataset_stage_1(dup_synthetic, artifacts_dir=str(tmp_path))
+        result = clean_dataset(dup_synthetic, artifacts_dir=str(tmp_path))
 
         assert "artifact_path" in result
         assert "changelog_path" in result
@@ -593,7 +593,7 @@ class TestDtypeFixing:
 
     def test_all_four_stages_end_to_end(self, tmp_path, full_pipeline_df: pd.DataFrame):
         """Full 4-stage orchestration works end-to-end with a dataset needing all steps."""
-        result = clean_dataset_stage_1(full_pipeline_df, artifacts_dir=str(tmp_path))
+        result = clean_dataset(full_pipeline_df, artifacts_dir=str(tmp_path))
 
         summary = result["summary"]
         assert "duplicate_removal" in summary

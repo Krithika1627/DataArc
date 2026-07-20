@@ -517,8 +517,8 @@ def fix_dtypes(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     return result_df, summary
 
 
-@with_agent_logging("cleaning_orchestration")
-def clean_dataset_stage_1(
+@with_agent_logging("data_cleaning_orchestration")
+def clean_dataset(
     df: pd.DataFrame,
     artifacts_dir: str = "artifacts",
     target_column: str | None = None,
