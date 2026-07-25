@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import pandas as pd
+import plotly.express as px
 
 from logging_utils import with_agent_logging
 
@@ -103,5 +104,69 @@ def compute_eda_stats(
         "flagged_correlations": flagged_correlations,
         "distribution_stats": distribution_stats,
         "class_balance": class_balance,
+    }
+
+
+@with_agent_logging("eda_histogram_generation")
+def generate_histograms(
+    df: pd.DataFrame,
+    exclude_columns: list[str] | None = None,
+) -> dict[str, Any]:
+    """Generate Plotly histograms for each numeric column in the DataFrame."""
+    if len(df) == 0:
+        raise ValueError(
+            "DataFrame is empty. Cannot generate histograms on zero rows."
+        )
+
+    exclude = set(exclude_columns or [])
+    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+
+    histograms: dict[str, str] = {}
+    skipped: list[dict[str, str]] = []
+
+    for col in numeric_cols:
+        col_str = str(col)
+        if col_str in exclude:
+            continue
+
+        series = df[col].dropna()
+
+        if len(series) == 0:
+            skipped.append({"column": col_str, "reason": "Column is entirely NaN"})
+            continue
+
+        unique_vals = series.nunique()
+
+        if unique_vals <= 1:
+            # Constant column: single bar
+            fig = px.histogram(
+                series,
+                nbins=1,
+                title=col_str,
+            )
+        elif unique_vals < 10:
+            # Few unique values: reduce bins to match
+            fig = px.histogram(
+                series,
+                nbins=unique_vals,
+                title=col_str,
+            )
+        else:
+            fig = px.histogram(
+                series,
+                title=col_str,
+            )
+
+        fig.update_layout(
+            xaxis_title=col_str,
+            yaxis_title="Count",
+            showlegend=False,
+        )
+
+        histograms[col_str] = fig.to_json()
+
+    return {
+        "histograms": histograms,
+        "skipped_columns": skipped,
     }
 

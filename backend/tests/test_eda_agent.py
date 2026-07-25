@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
+
+import numpy as np
 import pytest
 import pandas as pd
 
-from agents.eda_agent import compute_eda_stats
+from agents.eda_agent import compute_eda_stats, generate_histograms
 
 
 class TestComputeEdaStatsValidInputs:
@@ -201,3 +204,118 @@ class TestComputeEdaStatsOrchestration:
         # At least some numeric columns to analyse
         assert len(result["skewness"]) > 0
         assert len(result["distribution_stats"]) > 0
+
+
+class TestGenerateHistograms:
+    """Tests for generate_histograms()."""
+
+    @pytest.fixture
+    def mixed_df(self) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "age": [22, 38, 26, 35, 28, 40, 25, 30, 45, 33],
+                "fare": [7.25, 71.28, 8.05, 53.10, 15.50, 80.00, 12.00, 22.00, 50.00, 35.00],
+                "pclass": [3, 1, 3, 1, 3, 2, 3, 2, 1, 2],
+                "passenger_id": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                "sex": ["male", "female", "male", "female", "male", "female", "male", "female", "female", "male"],
+            }
+        )
+
+    def test_one_histogram_per_numeric_column(self, mixed_df):
+        result = generate_histograms(mixed_df)
+        # 4 numeric columns: age, fare, pclass, passenger_id
+        assert len(result["histograms"]) == 4
+        for col in ("age", "fare", "pclass", "passenger_id"):
+            assert col in result["histograms"]
+
+    def test_histograms_are_valid_json(self, mixed_df):
+        result = generate_histograms(mixed_df)
+        for col, json_str in result["histograms"].items():
+            # Should be a valid JSON string
+            parsed = json.loads(json_str)
+            assert isinstance(parsed, dict)
+            # Plotly JSON should have 'data' and 'layout' keys
+            assert "data" in parsed
+            assert "layout" in parsed
+
+    def test_skipped_columns_empty_when_all_valid(self, mixed_df):
+        result = generate_histograms(mixed_df)
+        assert result["skipped_columns"] == []
+
+    def test_empty_dataframe_raises(self):
+        df = pd.DataFrame()
+        with pytest.raises(ValueError, match="DataFrame is empty"):
+            generate_histograms(df)
+
+    def test_no_numeric_columns(self):
+        df = pd.DataFrame({"a": ["x", "y", "z"], "b": ["foo", "bar", "baz"]})
+        result = generate_histograms(df)
+        assert result["histograms"] == {}
+        assert result["skipped_columns"] == []
+
+    def test_exclude_columns_skips_those_columns(self, mixed_df):
+        result = generate_histograms(mixed_df, exclude_columns=["passenger_id", "age"])
+        hist = result["histograms"]
+        assert "passenger_id" not in hist
+        assert "age" not in hist
+        assert "fare" in hist
+        assert "pclass" in hist
+        assert len(hist) == 2
+
+    def test_exclude_nonexistent_column_ignored(self, mixed_df):
+        result = generate_histograms(mixed_df, exclude_columns=["nonexistent_col"])
+        hist = result["histograms"]
+        # Nonexistent column is silently ignored, all 4 numeric columns present
+        assert len(hist) == 4
+        for col in ("age", "fare", "pclass", "passenger_id"):
+            assert col in hist
+
+    def test_constant_column_produces_histogram(self):
+        df = pd.DataFrame({"constant": [5, 5, 5, 5, 5], "other": [1.0, 2.0, 3.0, 4.0, 5.0]})
+        result = generate_histograms(df)
+        assert "constant" in result["histograms"]
+        assert "other" in result["histograms"]
+        # constant histogram should be valid JSON
+        parsed = json.loads(result["histograms"]["constant"])
+        assert "data" in parsed
+        assert "layout" in parsed
+
+    def test_all_nan_column_skipped(self):
+        df = pd.DataFrame(
+            {
+                "good_col": [1.0, 2.0, 3.0],
+                "all_nan": [np.nan, np.nan, np.nan],
+            }
+        )
+        result = generate_histograms(df)
+        assert "all_nan" not in result["histograms"]
+        assert "good_col" in result["histograms"]
+        assert len(result["skipped_columns"]) == 1
+        assert result["skipped_columns"][0]["column"] == "all_nan"
+        assert "NaN" in result["skipped_columns"][0]["reason"]
+
+    def test_mixed_nan_column_partial_nan_included(self):
+        """Column with some NaN values should still produce a histogram (NaN dropped)."""
+        df = pd.DataFrame(
+            {
+                "partially_nan": [1.0, None, 3.0, None, 5.0],
+            }
+        )
+        result = generate_histograms(df)
+        assert "partially_nan" in result["histograms"]
+        assert result["skipped_columns"] == []
+        parsed = json.loads(result["histograms"]["partially_nan"])
+        assert "data" in parsed
+
+    def test_large_dataset_does_not_crash(self):
+        """10,000+ rows should still produce histograms efficiently."""
+        rng = np.random.default_rng(42)
+        df = pd.DataFrame(
+            {
+                "col_a": rng.normal(0, 1, 10_000),
+                "col_b": rng.uniform(0, 100, 10_000),
+            }
+        )
+        result = generate_histograms(df)
+        assert len(result["histograms"]) == 2
+        assert result["skipped_columns"] == []
