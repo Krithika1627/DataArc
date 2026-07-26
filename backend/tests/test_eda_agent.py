@@ -6,10 +6,27 @@ import numpy as np
 import pytest
 import pandas as pd
 
-from agents.eda_agent import compute_eda_stats, generate_histograms
+from agents.eda_agent import compute_eda_stats, generate_histograms, generate_correlation_heatmap
+
+
+@pytest.fixture
+def titanic_like() -> pd.DataFrame:
+    """Module-level fixture accessible by all test classes."""
+    return pd.DataFrame(
+        {
+            "age": [22, 38, 26, 35, 28, 40, 25, 30, 45, 33],
+            "fare": [7.25, 71.28, 8.05, 53.10, 15.50, 80.00, 12.00, 22.00, 50.00, 35.00],
+            "pclass": [3, 1, 3, 1, 3, 2, 3, 2, 1, 2],
+            "survived": [0, 1, 0, 1, 0, 1, 0, 1, 1, 0],
+            "sex": ["male", "female", "male", "female", "male", "female", "male", "female", "female", "male"],
+            "embarked": ["S", "C", "S", "S", "Q", "C", "S", "S", "C", "Q"],
+        }
+    )
 
 
 class TestComputeEdaStatsValidInputs:
+    """Tests with a realistic mixed numeric/categorical dataset (Titanic-like)."""
+
     """Tests with a realistic mixed numeric/categorical dataset (Titanic-like)."""
 
     @pytest.fixture
@@ -319,3 +336,103 @@ class TestGenerateHistograms:
         result = generate_histograms(df)
         assert len(result["histograms"]) == 2
         assert result["skipped_columns"] == []
+
+
+class TestGenerateCorrelationHeatmap:
+    """Tests for generate_correlation_heatmap()."""
+
+    @pytest.fixture
+    def real_matrix(self, titanic_like) -> dict:
+        """Pass a real dataset through compute_eda_stats() to get a real correlation_matrix."""
+        stats = compute_eda_stats(titanic_like)
+        return stats["correlation_matrix"]
+
+    def test_normal_case_valid_json(self, real_matrix):
+        result = generate_correlation_heatmap(real_matrix)
+        parsed = json.loads(result)
+        assert "data" in parsed
+        assert "layout" in parsed
+        # Should have 4 columns in the heatmap (age, fare, pclass, survived)
+        data = parsed["data"][0]
+        assert len(data["x"]) == 4
+        assert len(data["y"]) == 4
+        # Title should be set
+        assert parsed["layout"]["title"]["text"] == "Correlation Heatmap"
+
+    def test_normal_case_preserves_column_order(self, real_matrix):
+        """Column order in the heatmap should match the dict's order."""
+        result = generate_correlation_heatmap(real_matrix)
+        parsed = json.loads(result)
+        x_labels = parsed["data"][0]["x"]
+        # The matrix keys order from compute_eda_stats: age, fare, pclass, survived
+        assert x_labels == ["age", "fare", "pclass", "survived"]
+
+    def test_normal_case_annotation_values(self, real_matrix):
+        """Diagonal should show 1.00, off-diagonal should have sensible values."""
+        result = generate_correlation_heatmap(real_matrix)
+        parsed = json.loads(result)
+        text = parsed["data"][0]["text"]
+        # Diagonal should be "1.00"
+        assert text[0][0] == "1.00"
+        assert text[1][1] == "1.00"
+        assert text[2][2] == "1.00"
+        assert text[3][3] == "1.00"
+
+    def test_empty_dict_raises(self):
+        with pytest.raises(ValueError, match="Correlation matrix is empty"):
+            generate_correlation_heatmap({})
+
+    def test_single_column_matrix(self):
+        matrix = {"age": {"age": 1.0}}
+        result = generate_correlation_heatmap(matrix)
+        parsed = json.loads(result)
+        data = parsed["data"][0]
+        assert data["x"] == ["age"]
+        assert data["y"] == ["age"]
+        assert data["text"] == [["1.00"]]
+
+    def test_malformed_not_nested_dict_raises(self):
+        """Value is a scalar instead of a nested dict."""
+        with pytest.raises(ValueError, match="malformed"):
+            generate_correlation_heatmap({"col_a": 1.0})
+
+    def test_malformed_asymmetric_dict_raises(self):
+        """col_a has col_b but not vice versa."""
+        matrix = {
+            "col_a": {"col_b": 0.8},
+            "col_b": {"col_a": 0.8, "col_c": 0.5},
+        }
+        with pytest.raises(ValueError, match="asymmetric"):
+            generate_correlation_heatmap(matrix)
+
+    def test_malformed_non_numeric_value_raises(self):
+        """One value is a string instead of a number."""
+        matrix = {
+            "col_a": {"col_a": 1.0, "col_b": "not_a_number"},
+            "col_b": {"col_a": 0.8, "col_b": 1.0},
+        }
+        with pytest.raises(ValueError, match="non-numeric"):
+            generate_correlation_heatmap(matrix)
+
+    def test_rejects_non_dict_input(self):
+        with pytest.raises(ValueError, match="not a dict"):
+            generate_correlation_heatmap("not_a_dict")  # type: ignore
+
+    def test_diverging_colorscale_centered_at_zero(self, real_matrix):
+        """The color scale should be diverging (RdBu_r), centered at 0."""
+        result = generate_correlation_heatmap(real_matrix)
+        parsed = json.loads(result)
+        trace = parsed["data"][0]
+        # zmid=0 confirms the scale is centered at the meaningful midpoint
+        assert trace["zmid"] == 0
+        # zmin=-1 and zmax=1 for proper correlation range
+        assert trace["zmin"] == -1
+        assert trace["zmax"] == 1
+        # colorscale should be expanded from "RdBu_r" into a list of [position, color] pairs
+        assert isinstance(trace["colorscale"], list)
+        assert len(trace["colorscale"]) > 0
+        # First entry should be blue-ish (negative end of RdBu_r)
+        first_color = trace["colorscale"][0][1].lower()
+        last_color = trace["colorscale"][-1][1].lower()
+        assert "rgb" in first_color  # expanded from named scale
+        assert "rgb" in last_color

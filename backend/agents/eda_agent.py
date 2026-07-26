@@ -4,6 +4,7 @@ from typing import Any
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 
 from logging_utils import with_agent_logging
 
@@ -170,3 +171,68 @@ def generate_histograms(
         "skipped_columns": skipped,
     }
 
+
+@with_agent_logging("eda_correlation_heatmap")
+def generate_correlation_heatmap(correlation_matrix: dict) -> str:
+    """Convert a correlation matrix (nested dict) into a Plotly heatmap JSON string."""
+    if not isinstance(correlation_matrix, dict) or len(correlation_matrix) == 0:
+        raise ValueError(
+            "Correlation matrix is empty or not a dict. "
+            "Cannot generate a heatmap without numeric columns to correlate."
+        )
+
+    columns = list(correlation_matrix.keys())
+    for col_a in columns:
+        row = correlation_matrix[col_a]
+        if not isinstance(row, dict):
+            raise ValueError(
+                f"Correlation matrix is malformed: value for column '{col_a}' "
+                f"is {type(row).__name__}, expected a dict."
+            )
+        for col_b in columns:
+            if col_b not in row:
+                raise ValueError(
+                    f"Correlation matrix is asymmetric: column '{col_a}' has "
+                    f"{len(row)} entries but column '{col_b}' is missing."
+                )
+            val = row[col_b]
+            if not isinstance(val, (int, float)):
+                raise ValueError(
+                    f"Correlation matrix has non-numeric value at "
+                    f"[{col_a}][{col_b}]: {val!r}"
+                )
+
+    z = [
+        [correlation_matrix[col_a][col_b] for col_b in columns]
+        for col_a in columns
+    ]
+    text = [
+        [f"{correlation_matrix[col_a][col_b]:.2f}" for col_b in columns]
+        for col_a in columns
+    ]
+
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=z,
+            x=columns,
+            y=columns,
+            text=text,
+            texttemplate="%{text}",
+            colorscale="RdBu_r",
+            zmid=0,
+            zmin=-1,
+            zmax=1,
+            hovertemplate="%{x} vs %{y}: %{text}<extra></extra>",
+        )
+    )
+
+    fig.update_layout(
+        title="Correlation Heatmap",
+        xaxis_title="",
+        yaxis_title="",
+        width=600,
+        height=600,
+        xaxis=dict(side="bottom"),
+    )
+
+    return fig.to_json()
