@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import pandas as pd
 
-from agents.eda_agent import compute_eda_stats, generate_histograms, generate_correlation_heatmap
+from agents.eda_agent import compute_eda_stats, generate_histograms, generate_correlation_heatmap, generate_boxplots
 
 
 @pytest.fixture
@@ -436,3 +436,117 @@ class TestGenerateCorrelationHeatmap:
         last_color = trace["colorscale"][-1][1].lower()
         assert "rgb" in first_color  # expanded from named scale
         assert "rgb" in last_color
+
+
+class TestGenerateBoxplots:
+    """Tests for generate_boxplots()."""
+
+    @pytest.fixture
+    def mixed_df(self) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "age": [22, 38, 26, 35, 28, 40, 25, 30, 45, 33],
+                "fare": [7.25, 71.28, 8.05, 53.10, 15.50, 80.00, 12.00, 22.00, 50.00, 35.00],
+                "pclass": [3, 1, 3, 1, 3, 2, 3, 2, 1, 2],
+                "passenger_id": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                "sex": ["male", "female", "male", "female", "male", "female", "male", "female", "female", "male"],
+            }
+        )
+
+    def test_outlier_columns_none_falls_back_to_all_numeric(self, mixed_df):
+        """outlier_columns=None => box plots for all numeric columns."""
+        result = generate_boxplots(mixed_df)
+        assert len(result["boxplots"]) == 4
+        for col in ("age", "fare", "pclass", "passenger_id"):
+            assert col in result["boxplots"]
+
+    def test_explicit_outlier_columns_list(self, mixed_df):
+        """Only the specified columns appear in output."""
+        result = generate_boxplots(mixed_df, outlier_columns=["fare", "age"])
+        assert set(result["boxplots"].keys()) == {"fare", "age"}
+
+    def test_outlier_columns_nonexistent_raises(self, mixed_df):
+        """Column in outlier_columns that doesn't exist => ValueError naming the bad column."""
+        with pytest.raises(ValueError, match="nonexistent_col"):
+            generate_boxplots(mixed_df, outlier_columns=["age", "nonexistent_col"])
+
+    def test_outlier_columns_non_numeric_raises(self, mixed_df):
+        """Column in outlier_columns that is not numeric => ValueError."""
+        with pytest.raises(ValueError, match="sex"):
+            generate_boxplots(mixed_df, outlier_columns=["sex"])
+
+    def test_empty_outlier_columns_list_returns_empty(self, mixed_df):
+        """outlier_columns=[] (explicit empty) => empty dict, no fallback to all numeric."""
+        result = generate_boxplots(mixed_df, outlier_columns=[])
+        assert result["boxplots"] == {}
+
+    def test_empty_dataframe_raises(self):
+        df = pd.DataFrame()
+        with pytest.raises(ValueError, match="DataFrame is empty"):
+            generate_boxplots(df)
+
+    def test_exclude_columns_with_none_outlier_columns(self, mixed_df):
+        """exclude_columns works with outlier_columns=None."""
+        result = generate_boxplots(mixed_df, exclude_columns=["passenger_id", "age"])
+        box = result["boxplots"]
+        assert "passenger_id" not in box
+        assert "age" not in box
+        assert "fare" in box
+        assert "pclass" in box
+        assert len(box) == 2
+
+    def test_exclude_nonexistent_column_ignored(self, mixed_df):
+        """Nonexistent exclude column is silently ignored."""
+        result = generate_boxplots(mixed_df, exclude_columns=["nonexistent_col"])
+        assert len(result["boxplots"]) == 4
+
+    def test_constant_column_produces_boxplot(self):
+        """A column with only 1 unique value should still produce a valid box plot."""
+        df = pd.DataFrame({"constant": [5, 5, 5, 5, 5], "other": [1.0, 2.0, 3.0, 4.0, 5.0]})
+        result = generate_boxplots(df)
+        assert "constant" in result["boxplots"]
+        assert "other" in result["boxplots"]
+        parsed = json.loads(result["boxplots"]["constant"])
+        assert "data" in parsed
+        assert "layout" in parsed
+
+    def test_all_nan_column_skipped(self):
+        """All-NaN column appears in skipped_columns, not in boxplots."""
+        df = pd.DataFrame(
+            {
+                "good_col": [1.0, 2.0, 3.0],
+                "all_nan": [np.nan, np.nan, np.nan],
+            }
+        )
+        result = generate_boxplots(df)
+        assert "all_nan" not in result["boxplots"]
+        assert "good_col" in result["boxplots"]
+        assert len(result["skipped_columns"]) == 1
+        assert result["skipped_columns"][0]["column"] == "all_nan"
+        assert "NaN" in result["skipped_columns"][0]["reason"]
+
+    def test_boxplots_are_valid_json(self, mixed_df):
+        """Every boxplot value should be a valid Plotly JSON string."""
+        result = generate_boxplots(mixed_df)
+        for col, json_str in result["boxplots"].items():
+            parsed = json.loads(json_str)
+            assert isinstance(parsed, dict)
+            assert "data" in parsed
+            assert "layout" in parsed
+
+    def test_skipped_columns_empty_when_all_valid(self, mixed_df):
+        """No all-NaN columns should result in an empty skipped_columns list."""
+        result = generate_boxplots(mixed_df)
+        assert result["skipped_columns"] == []
+
+    def test_exclude_with_explicit_outlier_columns(self, mixed_df):
+        """exclude_columns filters from an explicit outlier_columns list."""
+        result = generate_boxplots(
+            mixed_df,
+            outlier_columns=["age", "fare", "pclass"],
+            exclude_columns=["age"],
+        )
+        assert "age" not in result["boxplots"]
+        assert "fare" in result["boxplots"]
+        assert "pclass" in result["boxplots"]
+        assert len(result["boxplots"]) == 2

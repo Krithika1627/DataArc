@@ -236,3 +236,64 @@ def generate_correlation_heatmap(correlation_matrix: dict) -> str:
     )
 
     return fig.to_json()
+
+
+@with_agent_logging("eda_boxplot_generation")
+def generate_boxplots(
+    df: pd.DataFrame,
+    outlier_columns: list[str] | None = None,
+    exclude_columns: list[str] | None = None,
+) -> dict[str, Any]:
+    """Generate Plotly box plots for specified numeric columns."""
+    if len(df) == 0:
+        raise ValueError(
+            "DataFrame is empty. Cannot generate box plots on zero rows."
+        )
+
+    exclude = set(exclude_columns or [])
+    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+
+    if outlier_columns is not None:
+        if len(outlier_columns) == 0:
+            return {"boxplots": {}, "skipped_columns": []}
+        for col in outlier_columns:
+            if col not in df.columns:
+                raise ValueError(
+                    f"Column '{col}' in outlier_columns does not exist in the DataFrame. "
+                    f"Available columns: {sorted(str(c) for c in df.columns)}"
+                )
+            if col not in numeric_cols:
+                raise ValueError(
+                    f"Column '{col}' in outlier_columns is not numeric. "
+                    f"Numeric columns: {sorted(numeric_cols)}"
+                )
+        plot_cols = outlier_columns
+    else:
+        plot_cols = numeric_cols
+
+    boxplots: dict[str, str] = {}
+    skipped: list[dict[str, str]] = []
+
+    for col in plot_cols:
+        col_str = str(col)
+        if col_str in exclude:
+            continue
+
+        series = df[col].dropna()
+
+        if len(series) == 0:
+            skipped.append({"column": col_str, "reason": "Column is entirely NaN"})
+            continue
+
+        fig = px.box(series, title=col_str)
+        fig.update_layout(
+            yaxis_title=col_str,
+            showlegend=False,
+        )
+
+        boxplots[col_str] = fig.to_json()
+
+    return {
+        "boxplots": boxplots,
+        "skipped_columns": skipped,
+    }
