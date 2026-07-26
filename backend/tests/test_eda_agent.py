@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import pandas as pd
 
-from agents.eda_agent import compute_eda_stats, generate_histograms, generate_correlation_heatmap, generate_boxplots
+from agents.eda_agent import compute_eda_stats, generate_histograms, generate_correlation_heatmap, generate_boxplots, generate_target_distribution
 
 
 @pytest.fixture
@@ -550,3 +550,132 @@ class TestGenerateBoxplots:
         assert "fare" in result["boxplots"]
         assert "pclass" in result["boxplots"]
         assert len(result["boxplots"]) == 2
+
+
+class TestGenerateTargetDistribution:
+    """Tests for generate_target_distribution()."""
+
+    @pytest.fixture
+    def mixed_df(self) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "age": [22, 38, 26, 35, 28, 40, 25, 30, 45, 33],
+                "fare": [7.25, 71.28, 8.05, 53.10, 15.50, 80.00, 12.00, 22.00, 50.00, 35.00],
+                "pclass": [3, 1, 3, 1, 3, 2, 3, 2, 1, 2],
+                "survived": [0, 1, 0, 1, 0, 1, 0, 1, 1, 0],
+                "sex": ["male", "female", "male", "female", "male", "female", "male", "female", "female", "male"],
+            }
+        )
+
+    @pytest.fixture
+    def many_class_df(self) -> pd.DataFrame:
+        """DataFrame with 25 unique classes — exceeds the 20-class limit."""
+        return pd.DataFrame({
+            "target": list(range(25)),
+            "feature": [0] * 25,
+        })
+
+    @pytest.fixture
+    def single_class_df(self) -> pd.DataFrame:
+        """DataFrame with only 1 unique class present."""
+        return pd.DataFrame({
+            "target": [1, 1, 1, 1, 1],
+            "feature": range(5),
+        })
+
+    def test_classification_bar_chart(self, mixed_df):
+        """Classification target produces a bar chart with text labels."""
+        result = generate_target_distribution(mixed_df, target_column="survived", problem_type="classification")
+        parsed = json.loads(result)
+        assert "data" in parsed
+        assert "layout" in parsed
+        trace = parsed["data"][0]
+        # Bar trace has type "bar"
+        assert trace["type"] == "bar"
+        # Should have text labels
+        assert "text" in trace
+        assert trace.get("textposition") == "outside"
+        # Title should include the target column name
+        assert "Target Distribution: survived" in parsed["layout"]["title"]["text"]
+
+    def test_classification_binary_works(self, mixed_df):
+        """Binary classification (2 classes) works normally."""
+        result = generate_target_distribution(mixed_df, target_column="survived", problem_type="classification")
+        parsed = json.loads(result)
+        trace = parsed["data"][0]
+        # Survived has 2 classes (0 and 1)
+        assert len(trace["x"]) == 2
+        assert len(trace["y"]) == 2
+
+    def test_regression_histogram(self, mixed_df):
+        """Regression target produces a histogram."""
+        result = generate_target_distribution(mixed_df, target_column="age", problem_type="regression")
+        parsed = json.loads(result)
+        assert "data" in parsed
+        assert "layout" in parsed
+        trace = parsed["data"][0]
+        # Histogram type
+        assert trace["type"] == "histogram"
+        # Title should include the target column name
+        assert "Target Distribution: age" in parsed["layout"]["title"]["text"]
+
+    def test_target_column_not_in_df_raises(self, mixed_df):
+        """Nonexistent target column raises ValueError."""
+        with pytest.raises(ValueError, match="not_present"):
+            generate_target_distribution(mixed_df, target_column="not_present", problem_type="classification")
+
+    def test_target_column_all_nan_raises(self):
+        """Entirely NaN target column raises ValueError."""
+        df = pd.DataFrame({"target": [np.nan, np.nan, np.nan], "feature": [1, 2, 3]})
+        with pytest.raises(ValueError, match="entirely NaN"):
+            generate_target_distribution(df, target_column="target", problem_type="classification")
+
+    def test_unrecognized_problem_type_raises(self, mixed_df):
+        """problem_type other than classification/regression raises ValueError."""
+        with pytest.raises(ValueError, match="Unsupported problem_type"):
+            generate_target_distribution(mixed_df, target_column="age", problem_type="clustering")
+
+    def test_unclear_problem_type_raises(self, mixed_df):
+        """problem_type='unclear' raises ValueError."""
+        with pytest.raises(ValueError, match="Unsupported problem_type"):
+            generate_target_distribution(mixed_df, target_column="age", problem_type="unclear")
+
+    def test_classification_too_many_classes_raises(self, many_class_df):
+        """Classification target with >20 unique values raises ValueError."""
+        with pytest.raises(ValueError, match="exceeds the maximum of 20"):
+            generate_target_distribution(many_class_df, target_column="target", problem_type="classification")
+
+    def test_classification_single_class_produces_chart(self, single_class_df):
+        """Classification target with only 1 unique value produces a valid single-bar chart."""
+        result = generate_target_distribution(single_class_df, target_column="target", problem_type="classification")
+        parsed = json.loads(result)
+        trace = parsed["data"][0]
+        assert trace["type"] == "bar"
+        # Verify data exists (handles both plain lists and plotly typed-array dicts)
+        assert "x" in trace
+        assert "y" in trace
+
+    def test_regression_with_some_nans(self):
+        """Regression target with some NaN values produces a valid chart (NaNs excluded)."""
+        df = pd.DataFrame({"target": [1.0, 2.0, np.nan, 4.0, np.nan, 6.0], "feature": range(6)})
+        result = generate_target_distribution(df, target_column="target", problem_type="regression")
+        parsed = json.loads(result)
+        assert "data" in parsed
+        trace = parsed["data"][0]
+        assert trace["type"] == "histogram"
+
+    def test_classification_valid_json(self, mixed_df):
+        """Classification result is valid JSON."""
+        result = generate_target_distribution(mixed_df, target_column="survived", problem_type="classification")
+        parsed = json.loads(result)
+        assert isinstance(parsed, dict)
+        assert "data" in parsed
+        assert "layout" in parsed
+
+    def test_regression_valid_json(self, mixed_df):
+        """Regression result is valid JSON."""
+        result = generate_target_distribution(mixed_df, target_column="age", problem_type="regression")
+        parsed = json.loads(result)
+        assert isinstance(parsed, dict)
+        assert "data" in parsed
+        assert "layout" in parsed

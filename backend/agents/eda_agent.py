@@ -238,6 +238,84 @@ def generate_correlation_heatmap(correlation_matrix: dict) -> str:
     return fig.to_json()
 
 
+@with_agent_logging("eda_target_distribution")
+def generate_target_distribution(
+    df: pd.DataFrame,
+    target_column: str,
+    problem_type: str,
+) -> str:
+    """Generate a Plotly chart for the target variable distribution."""
+    if target_column not in df.columns:
+        raise ValueError(
+            f"target_column '{target_column}' is not present in the DataFrame. "
+            f"Available columns: {sorted(str(c) for c in df.columns)}"
+        )
+
+    if df[target_column].isna().all():
+        raise ValueError(
+            f"target_column '{target_column}' is entirely NaN. "
+            "Cannot generate a distribution chart with no valid data."
+        )
+
+    if problem_type == "classification":
+        series = df[target_column].dropna()
+        unique_vals = series.nunique()
+
+        if unique_vals > 20:
+            raise ValueError(
+                f"target_column '{target_column}' has {unique_vals} unique values, "
+                "which exceeds the maximum of 20 for classification. "
+                "This column may not be a sensible classification target, or "
+                f"the problem_type may be mislabeled (try '{unique_vals} unique values' for regression?)."
+            )
+
+        counts = series.value_counts().sort_index()
+        x_vals = list(counts.index.astype(str))
+        y_vals = [int(v) for v in counts.values]
+        fig = px.bar(
+            x=x_vals,
+            y=y_vals,
+            title=f"Target Distribution: {target_column}",
+            labels={"x": target_column, "y": "Count"},
+            text=y_vals,
+        )
+        fig.update_traces(
+            textposition="outside",
+            textfont_size=11,
+        )
+        fig.update_layout(
+            showlegend=False,
+            yaxis_title="Count",
+            xaxis_title=target_column,
+        )
+
+    elif problem_type == "regression":
+        series = df[target_column].dropna()
+        unique_vals = series.nunique()
+
+        if unique_vals <= 1:
+            fig = px.histogram(series, nbins=1, title=f"Target Distribution: {target_column}")
+        elif unique_vals < 10:
+            fig = px.histogram(series, nbins=unique_vals, title=f"Target Distribution: {target_column}")
+        else:
+            fig = px.histogram(series, title=f"Target Distribution: {target_column}")
+
+        fig.update_layout(
+            xaxis_title=target_column,
+            yaxis_title="Count",
+            showlegend=False,
+        )
+
+    else:
+        raise ValueError(
+            f"Unsupported problem_type '{problem_type}'. "
+            "Target distribution charts are only supported for "
+            "'classification' and 'regression'."
+        )
+
+    return fig.to_json()
+
+
 @with_agent_logging("eda_boxplot_generation")
 def generate_boxplots(
     df: pd.DataFrame,
