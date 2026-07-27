@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import json
+import unittest.mock
 
 import numpy as np
 import pytest
 import pandas as pd
 
-from agents.eda_agent import compute_eda_stats, generate_histograms, generate_correlation_heatmap, generate_boxplots, generate_target_distribution
+from agents.eda_agent import (
+    compute_eda_stats,
+    generate_boxplots,
+    generate_correlation_heatmap,
+    generate_eda_insights,
+    generate_histograms,
+    generate_target_distribution,
+)
 
 
 @pytest.fixture
@@ -679,3 +687,285 @@ class TestGenerateTargetDistribution:
         assert isinstance(parsed, dict)
         assert "data" in parsed
         assert "layout" in parsed
+
+
+# EDA insights tests
+
+@pytest.fixture
+def eda_stats_typical() -> dict:
+    """A realistic compute_eda_stats() output with numeric columns."""
+    return {
+        "skewness": {
+            "age": 0.253,
+            "fare": 1.512,
+            "pclass": -0.418,
+            "survived": 0.0,
+        },
+        "correlation_matrix": {
+            "age": {"age": 1.0, "fare": 0.082, "pclass": -0.369, "survived": -0.077},
+            "fare": {"age": 0.082, "fare": 1.0, "pclass": -0.549, "survived": 0.257},
+            "pclass": {"age": -0.369, "fare": -0.549, "pclass": 1.0, "survived": -0.338},
+            "survived": {"age": -0.077, "fare": 0.257, "pclass": -0.338, "survived": 1.0},
+        },
+        "flagged_correlations": [
+            {"col_a": "age", "col_b": "pclass", "correlation": -0.369},
+            {"col_a": "fare", "col_b": "pclass", "correlation": -0.549},
+        ],
+        "distribution_stats": {
+            "age": {"mean": 32.2, "median": 31.5, "std": 7.1, "min": 22.0, "max": 45.0},
+            "fare": {"mean": 35.41, "median": 28.5, "std": 27.5, "min": 7.25, "max": 80.0},
+            "pclass": {"mean": 2.1, "median": 2.0, "std": 0.88, "min": 1.0, "max": 3.0},
+            "survived": {"mean": 0.5, "median": 0.5, "std": 0.53, "min": 0.0, "max": 1.0},
+        },
+        "class_balance": {
+            "class_counts": {"0": 5, "1": 5},
+            "class_percentages": {"0": 50.0, "1": 50.0},
+        },
+    }
+
+
+@pytest.fixture
+def eda_stats_numeric_only() -> dict:
+    """EDA stats with no class_balance (regression or no target supplied)."""
+    return {
+        "skewness": {
+            "age": 0.253,
+            "fare": 1.512,
+            "pclass": -0.418,
+        },
+        "correlation_matrix": {
+            "age": {"age": 1.0, "fare": 0.082, "pclass": -0.369},
+            "fare": {"age": 0.082, "fare": 1.0, "pclass": -0.549},
+            "pclass": {"age": -0.369, "fare": -0.549, "pclass": 1.0},
+        },
+        "flagged_correlations": [
+            {"col_a": "fare", "col_b": "pclass", "correlation": -0.549},
+        ],
+        "distribution_stats": {
+            "age": {"mean": 32.2, "median": 31.5, "std": 7.1, "min": 22.0, "max": 45.0},
+            "fare": {"mean": 35.41, "median": 28.5, "std": 27.5, "min": 7.25, "max": 80.0},
+            "pclass": {"mean": 2.1, "median": 2.0, "std": 0.88, "min": 1.0, "max": 3.0},
+        },
+        "class_balance": None,
+    }
+
+
+@pytest.fixture
+def eda_stats_empty_numeric() -> dict:
+    """EDA stats with no numeric columns at all."""
+    return {
+        "skewness": {},
+        "correlation_matrix": {},
+        "flagged_correlations": [],
+        "distribution_stats": {},
+        "class_balance": None,
+    }
+
+
+class TestGenerateEdaInsights:
+    """Tests for generate_eda_insights()."""
+
+    def test_mocked_valid_response(self, eda_stats_typical, monkeypatch):
+        """A well-formed mocked LLM response is parsed into the expected structure."""
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key-for-mocking")
+
+        mock_response = unittest.mock.MagicMock()
+        mock_response.text = (
+            '{"insights": ['
+            '"Fare is right-skewed (skewness=1.512), indicating a minority of high-fare passengers.", '
+            '"Fare and Pclass show a moderate negative correlation (-0.549), suggesting lower classes pay less.", '
+            '"Age is roughly symmetric (skewness=0.253) with a range of 22-45 years.", '
+            '"The class balance is perfectly even (50/50), making accuracy a reliable metric."'
+            '], '
+            '"summary": "The dataset shows moderate correlations between fare and class, '
+            'with a skewed fare distribution and a well-balanced target variable."}'
+        )
+
+        with unittest.mock.patch("google.genai.Client") as mock_client_class:
+            mock_client = unittest.mock.MagicMock()
+            mock_client.models.generate_content.return_value = mock_response
+            mock_client_class.return_value = mock_client
+
+            result = generate_eda_insights(eda_stats_typical)
+
+            assert "insights" in result
+            assert "summary" in result
+            assert len(result["insights"]) == 4
+            assert all(isinstance(i, str) for i in result["insights"])
+            assert isinstance(result["summary"], str)
+            assert "skewness=1.512" in result["insights"][0]
+            assert "50/50" in result["insights"][3]
+
+    def test_fallback_no_key(self, eda_stats_typical, monkeypatch):
+        """GEMINI_API_KEY not set → returns fallback, no crash, no network call."""
+        monkeypatch.setenv("GEMINI_API_KEY", "")
+
+        result = generate_eda_insights(eda_stats_typical)
+
+        assert "insights" in result
+        assert "summary" in result
+        assert "GEMINI_API_KEY is not set" in result["insights"][0]
+
+    def test_fallback_malformed_response_missing_key(self, eda_stats_typical, monkeypatch):
+        """LLM response missing 'insights' key → falls back gracefully."""
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key-for-mocking")
+
+        mock_response = unittest.mock.MagicMock()
+        mock_response.text = '{"summary": "Only a summary, no insights key"}'
+
+        with unittest.mock.patch("google.genai.Client") as mock_client_class:
+            mock_client = unittest.mock.MagicMock()
+            mock_client.models.generate_content.return_value = mock_response
+            mock_client_class.return_value = mock_client
+
+            result = generate_eda_insights(eda_stats_typical)
+
+            assert "insights" in result
+            assert "summary" in result
+            assert "LLM insights unavailable" in result["insights"][0]
+
+    def test_exclude_columns_strips_from_prompt(self, eda_stats_typical, monkeypatch):
+        """exclude_columns removes specified columns from stats before the prompt."""
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key-for-mocking")
+
+        mock_response = unittest.mock.MagicMock()
+        mock_response.text = (
+            '{"insights": ["Fare is right-skewed.", "Age is symmetric."], '
+            '"summary": "Two numeric columns remain after exclusion."}'
+        )
+
+        with unittest.mock.patch("google.genai.Client") as mock_client_class:
+            mock_client = unittest.mock.MagicMock()
+            mock_client.models.generate_content.return_value = mock_response
+            mock_client_class.return_value = mock_client
+
+            # Exclude pclass and survived
+            result = generate_eda_insights(
+                eda_stats_typical,
+                exclude_columns=["pclass", "survived"],
+            )
+
+            # Verify the LLM was called
+            mock_client.models.generate_content.assert_called_once()
+
+            # Extract the prompt that was sent
+            call_kwargs = mock_client.models.generate_content.call_args.kwargs
+            prompt_text = call_kwargs.get("contents", "")
+
+            # Excluded columns should not appear in the prompt
+            assert "pclass" not in prompt_text
+            assert "survived" not in prompt_text
+            # Non-excluded columns should still appear
+            assert "age" in prompt_text
+            assert "fare" in prompt_text
+
+            # The result itself should still have valid structure
+            assert len(result["insights"]) == 2
+
+    def test_empty_stats_llm_not_called(self, eda_stats_empty_numeric, monkeypatch):
+        """Empty numeric stats → returns 'not enough data' response, LLM never called."""
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key-for-mocking")
+
+        with unittest.mock.patch("google.genai.Client") as mock_client_class:
+            mock_client = unittest.mock.MagicMock()
+            mock_client_class.return_value = mock_client
+
+            result = generate_eda_insights(eda_stats_empty_numeric)
+
+            # LLM should never be called
+            mock_client.models.generate_content.assert_not_called()
+
+            assert "insights" in result
+            assert "summary" in result
+            assert "no numeric columns" in result["insights"][0].lower()
+            assert "LLM was not called" in result["summary"]
+
+    def test_exclude_columns_removes_all_llm_not_called(self, eda_stats_typical, monkeypatch):
+        """exclude_columns removing all numeric columns → LLM never called."""
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key-for-mocking")
+
+        with unittest.mock.patch("google.genai.Client") as mock_client_class:
+            mock_client = unittest.mock.MagicMock()
+            mock_client_class.return_value = mock_client
+
+            # Exclude ALL numeric columns
+            result = generate_eda_insights(
+                eda_stats_typical,
+                exclude_columns=["age", "fare", "pclass", "survived"],
+            )
+
+            mock_client.models.generate_content.assert_not_called()
+
+            assert "no numeric columns" in result["insights"][0].lower()
+            assert "LLM was not called" in result["summary"]
+
+    def test_class_balance_none_prompt_built_ok(self, eda_stats_numeric_only, monkeypatch):
+        """class_balance=None → prompt is built without errors, omits class balance section."""
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key-for-mocking")
+
+        mock_response = unittest.mock.MagicMock()
+        mock_response.text = (
+            '{"insights": ["Fare is right-skewed.", "Age is symmetric."], '
+            '"summary": "Summary without class balance."}'
+        )
+
+        with unittest.mock.patch("google.genai.Client") as mock_client_class:
+            mock_client = unittest.mock.MagicMock()
+            mock_client.models.generate_content.return_value = mock_response
+            mock_client_class.return_value = mock_client
+
+            result = generate_eda_insights(eda_stats_numeric_only)
+
+            mock_client.models.generate_content.assert_called_once()
+            call_kwargs = mock_client.models.generate_content.call_args.kwargs
+            prompt_text = call_kwargs.get("contents", "")
+
+            # CLASS BALANCE section should NOT appear in the prompt
+            assert "CLASS BALANCE" not in prompt_text
+            assert "No class balance" not in prompt_text
+
+            # Result structure is correct
+            assert len(result["insights"]) == 2
+            assert isinstance(result["summary"], str)
+
+    def test_exclude_nonexistent_column(self, eda_stats_typical, monkeypatch):
+        """Excluding a nonexistent column is silently ignored."""
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key-for-mocking")
+
+        mock_response = unittest.mock.MagicMock()
+        mock_response.text = (
+            '{"insights": ["Fare is right-skewed.", "Age is symmetric."], '
+            '"summary": "Summary."}'
+        )
+
+        with unittest.mock.patch("google.genai.Client") as mock_client_class:
+            mock_client = unittest.mock.MagicMock()
+            mock_client.models.generate_content.return_value = mock_response
+            mock_client_class.return_value = mock_client
+
+            result = generate_eda_insights(
+                eda_stats_typical,
+                exclude_columns=["nonexistent_col"],
+            )
+
+            mock_client.models.generate_content.assert_called_once()
+            call_kwargs = mock_client.models.generate_content.call_args.kwargs
+            prompt_text = call_kwargs.get("contents", "")
+
+            # All original columns should still be present
+            assert "age" in prompt_text
+            assert "fare" in prompt_text
+            assert "pclass" in prompt_text
+            assert "survived" in prompt_text
+            assert len(result["insights"]) == 2
+
+    @pytest.mark.llm
+    def test_live_api(self, eda_stats_typical):
+        """Requires a valid GEMINI_API_KEY environment variable."""
+        result = generate_eda_insights(eda_stats_typical)
+
+        assert "insights" in result
+        assert "summary" in result
+        assert len(result["insights"]) > 0
+        assert all(isinstance(i, str) for i in result["insights"])
+        assert isinstance(result["summary"], str)

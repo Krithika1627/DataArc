@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from typing import Any
+import os
+from typing import Any, TypedDict
 
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from dotenv import load_dotenv
 
 from logging_utils import with_agent_logging
 
@@ -139,14 +141,12 @@ def generate_histograms(
         unique_vals = series.nunique()
 
         if unique_vals <= 1:
-            # Constant column: single bar
             fig = px.histogram(
                 series,
                 nbins=1,
                 title=col_str,
             )
         elif unique_vals < 10:
-            # Few unique values: reduce bins to match
             fig = px.histogram(
                 series,
                 nbins=unique_vals,
@@ -314,6 +314,190 @@ def generate_target_distribution(
         )
 
     return fig.to_json()
+
+
+class _EdaInsightsResponse(TypedDict):
+    insights: list[str]
+    summary: str
+
+
+def _build_eda_insights_prompt(
+    skewness: dict[str, float],
+    flagged_correlations: list[dict[str, Any]],
+    distribution_stats: dict[str, dict[str, float]],
+    class_balance: dict[str, Any] | None,
+    target_column: str | None,
+    problem_type: str | None,
+) -> str:
+    lines = [
+        "You are a senior data scientist analysing a dataset's exploratory statistics.",
+        "Based on the computed statistics below, generate specific, quantitative insights.",
+        "",
+        "IMPORTANT: Each insight must be specific and quantitative, referencing actual",
+        "values from the statistics provided below. Never give generic advice.",
+        "",
+        'BAD example: "Column X has outliers"',
+        'GOOD example: "Fare and Pclass show a strong negative correlation '
+        '(-0.72), suggesting fare is heavily tied to class"',
+        "",
+        "SKEWNESS",
+    ]
+
+    if skewness:
+        for col, val in skewness.items():
+            lines.append(f"  - {col}: skewness={val}")
+    else:
+        lines.append("  - No skewness data available.")
+
+    if flagged_correlations:
+        lines.append("")
+        lines.append("FLAGGED CORRELATIONS (|r| > 0.7)")
+        for entry in flagged_correlations:
+            lines.append(
+                f"  - {entry['col_a']} <-> {entry['col_b']}: correlation={entry['correlation']}"
+            )
+
+    lines.append("")
+    lines.append("DISTRIBUTION STATISTICS")
+    if distribution_stats:
+        for col, stats in distribution_stats.items():
+            lines.append(
+                f"  - {col}: mean={stats['mean']}, median={stats['median']}, "
+                f"std={stats['std']}, range=[{stats['min']}, {stats['max']}]"
+            )
+    else:
+        lines.append("  - No distribution statistics available.")
+
+    if class_balance is not None:
+        lines.append("")
+        lines.append("CLASS BALANCE")
+        lines.append(f"  - Counts: {class_balance['class_counts']}")
+        lines.append(f"  - Percentages: {class_balance['class_percentages']}")
+
+    if target_column is not None and problem_type is not None:
+        lines.append("")
+        lines.append(f"TARGET: {target_column} ({problem_type} problem)")
+        lines.append(
+            "Frame your insights around this target where relevant. "
+            "For example, relate skewed features or strong correlations to "
+            "the target column."
+        )
+
+    lines.append("")
+    lines.append(
+        'Generate a JSON response with:\n'
+        '- "insights": a list of 4-6 specific, quantitative insights, each as a string\n'
+        '- "summary": a short 1-2 sentence overview tying the insights together'
+    )
+
+    return "\n".join(lines)
+
+
+@with_agent_logging("eda_insights_generation")
+def generate_eda_insights(
+    stats: dict,
+    target_column: str | None = None,
+    problem_type: str | None = None,
+    exclude_columns: list[str] | None = None,
+) -> dict:
+    fallback = {
+        "insights": [
+            "LLM insights unavailable: an unexpected error occurred. "
+            "Please review the EDA statistics directly."
+        ],
+        "summary": (
+            "Unable to generate insights automatically. "
+            "Please review the EDA statistics directly."
+        ),
+    }
+
+    exclude = set(exclude_columns or [])
+
+    skewness = {
+        k: v for k, v in stats.get("skewness", {}).items() if k not in exclude
+    }
+
+    flagged_correlations = [
+        entry
+        for entry in stats.get("flagged_correlations", [])
+        if entry["col_a"] not in exclude and entry["col_b"] not in exclude
+    ]
+
+    distribution_stats = {
+        k: v
+        for k, v in stats.get("distribution_stats", {}).items()
+        if k not in exclude
+    }
+
+    if not skewness or not distribution_stats:
+        return {
+            "insights": [
+                "The dataset has no numeric columns (or all numeric columns were "
+                "excluded) to compute EDA insights from. Add numeric features or "
+                "adjust the exclusion list to generate LLM insights."
+            ],
+            "summary": (
+                "Insufficient numeric data to generate EDA insights. "
+                "LLM was not called because there were no numeric columns to analyse."
+            ),
+        }
+
+    load_dotenv()
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        fallback["insights"] = [
+            "LLM insights unavailable: GEMINI_API_KEY is not set. "
+            "Create a .env file with GEMINI_API_KEY=your_key or export the variable."
+        ]
+        return fallback
+
+    try:
+        from google import genai
+
+        client = genai.Client(api_key=api_key)
+    except Exception as exc:
+        fallback["insights"] = [
+            f"LLM insights unavailable: failed to configure Gemini SDK: {exc}"
+        ]
+        return fallback
+
+    prompt = _build_eda_insights_prompt(
+        skewness=skewness,
+        flagged_correlations=flagged_correlations,
+        distribution_stats=distribution_stats,
+        class_balance=stats.get("class_balance"),
+        target_column=target_column,
+        problem_type=problem_type,
+    )
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-3.1-flash-lite",
+            contents=prompt,
+            config={
+                "response_mime_type": "application/json",
+                "response_schema": _EdaInsightsResponse,
+            },
+        )
+
+        import json as json_module
+
+        result = json_module.loads(response.text)
+
+        required_keys = {"insights", "summary"}
+        if not required_keys.issubset(result.keys()):
+            raise ValueError(
+                f"Response missing keys: {required_keys - result.keys()}"
+            )
+
+        if not isinstance(result["insights"], list):
+            raise ValueError("insights must be a list")
+
+        return result
+
+    except Exception as exc:
+        fallback["insights"] = [f"LLM insights unavailable: {exc}"]
+        return fallback
 
 
 @with_agent_logging("eda_boxplot_generation")

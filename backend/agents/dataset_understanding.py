@@ -6,7 +6,7 @@ from typing import TypedDict
 import pandas as pd
 from dotenv import load_dotenv
 
-from agents.logging_utils import with_agent_logging
+from logging_utils import with_agent_logging
 
 @with_agent_logging("dataset_profiling")
 def profile_dataset(df: pd.DataFrame) -> dict:
@@ -45,6 +45,20 @@ def profile_dataset(df: pd.DataFrame) -> dict:
     }
 
 
+def identify_id_columns(df: pd.DataFrame, threshold: float = 0.95) -> list[str]:
+    row_count = len(df)
+    if row_count == 0:
+        return []
+
+    id_columns = []
+    for col in df.columns:
+        unique_count = int(df[col].nunique())
+        if unique_count >= threshold * row_count:
+            id_columns.append(str(col))
+
+    return id_columns
+
+
 @with_agent_logging("target_detection")
 def detect_target_candidates(df: pd.DataFrame, return_all: bool = False) -> list[dict]:
     target_keywords = {"target", "label", "class", "y", "outcome", "result"}
@@ -52,6 +66,9 @@ def detect_target_candidates(df: pd.DataFrame, return_all: bool = False) -> list
     row_count = len(df)
     col_count = len(df.columns)
     all_scores = []
+
+    # Identify ID-like columns once, reusable across the loop
+    id_columns = identify_id_columns(df)
 
     for i, col in enumerate(df.columns):
         col_name = str(col)
@@ -73,7 +90,7 @@ def detect_target_candidates(df: pd.DataFrame, return_all: bool = False) -> list
                 f"Low cardinality ({unique_count} unique values) suggests a classification target"
             )
 
-        # Combined last-column rule (mutually exclusive a / b)
+        # Combined last-column rule 
         is_last = i == col_count - 1
         is_numeric = str(df[col].dtype) in ("int64", "float64")
         high_cardinality = unique_count > 10
@@ -93,7 +110,7 @@ def detect_target_candidates(df: pd.DataFrame, return_all: bool = False) -> list
             reasons.append("Column name contains a common outcome/target keyword")
 
         # ID column penalty (-30)
-        if unique_count >= 0.95 * row_count:
+        if col_name in id_columns:
             score -= 30
             reasons.append(
                 "Excluded: column has near-unique values per row, "

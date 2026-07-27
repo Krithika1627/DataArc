@@ -9,6 +9,7 @@ import pytest
 from agents.dataset_understanding import (
     classify_problem_type,
     detect_target_candidates,
+    identify_id_columns,
     profile_dataset,
 )
 
@@ -108,6 +109,98 @@ class TestDetectTargetCandidates:
 
         assert "ID" in " ".join(id_candidate["reasons"])
         assert label_candidate["confidence_score"] > id_candidate["confidence_score"]
+
+
+# identify_id_columns tests 
+
+class TestIdentifyIdColumns:
+    def test_obvious_id_column_detected(self):
+        """A sequential unique column is flagged as ID-like."""
+        df = pd.DataFrame({
+            "passenger_id": range(100),
+            "age": [25] * 100,
+            "name": [f"person_{i % 5}" for i in range(100)],
+        })
+        result = identify_id_columns(df)
+        assert result == ["passenger_id"]
+
+    def test_no_id_like_columns(self):
+        """No column meets the threshold → empty list."""
+        df = pd.DataFrame({
+            "group": ["A", "B", "C", "D", "A", "B", "C", "D"] * 10,
+            "label": [0, 1] * 40,
+        })
+        result = identify_id_columns(df)
+        assert result == []
+
+    def test_empty_dataframe_returns_empty_list(self):
+        df = pd.DataFrame()
+        result = identify_id_columns(df)
+        assert result == []
+
+    def test_column_order_preserved(self):
+        """Result should maintain df.columns order."""
+        df = pd.DataFrame({
+            "id_a": range(50),
+            "normal": [1, 2] * 25,
+            "id_b": range(50, 100),
+        })
+        result = identify_id_columns(df)
+        assert result == ["id_a", "id_b"]
+
+    def test_single_row_dataframe_all_columns_flagged(self):
+        """Single row → every column has 1 unique == 1 row, so all qualify."""
+        df = pd.DataFrame({
+            "a": [42],
+            "b": ["x"],
+        })
+        result = identify_id_columns(df)
+        assert result == ["a", "b"]
+
+    def test_custom_threshold(self):
+        """A lower threshold catches more columns."""
+        df = pd.DataFrame({
+            "high_card": range(100),
+            "med_card": [i % 50 for i in range(100)],
+            "low_card": [0] * 100,
+        })
+        # threshold=0.4: high_card (100/100=1.0) and med_card (50/100=0.5) qualify
+        result = identify_id_columns(df, threshold=0.4)
+        assert result == ["high_card", "med_card"]
+
+    def test_regression_detect_target_candidates_unchanged(self, id_and_target_df):
+        """Refactored detect_target_candidates() produces identical output.
+
+        This pins the exact expected output for a known input to ensure the
+        refactor (extracting ID column logic into identify_id_columns) does
+        not change behavior in any way.
+        """
+        candidates = detect_target_candidates(id_and_target_df, return_all=True)
+
+        assert len(candidates) == 2
+
+        # id column: penalised to score 0
+        assert candidates[0]["column_name"] == "label"
+        assert candidates[0]["confidence_score"] == 85
+        assert candidates[0]["reasons"] == [
+            "Column name matches common target naming pattern",
+            "Low cardinality (2 unique values) suggests a classification target",
+            "Column is the last column in the dataset (common target convention)",
+        ]
+
+        # id column: penalised to score 0
+        assert candidates[1]["column_name"] == "id"
+        assert candidates[1]["confidence_score"] == 0
+        assert candidates[1]["reasons"] == [
+            "Excluded: column has near-unique values per row, "
+            "likely an ID column, not a target",
+        ]
+
+        # Also confirm the default (non-return_all) output is unchanged
+        top = detect_target_candidates(id_and_target_df)
+        assert len(top) == 1
+        assert top[0]["column_name"] == "label"
+        assert top[0]["confidence_score"] == 85
 
 
 # Problem type classification tests 

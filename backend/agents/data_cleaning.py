@@ -8,7 +8,7 @@ from typing import TypedDict
 import pandas as pd
 from dotenv import load_dotenv
 
-from agents.logging_utils import with_agent_logging
+from logging_utils import with_agent_logging
 
 
 @with_agent_logging("duplicate_removal")
@@ -54,7 +54,6 @@ class _CleaningExplanationResponse(TypedDict):
 
 
 def _build_cleaning_prompt(changelog: dict) -> str:
-    """Build a compact, readable prompt from the structured changelog dict."""
     lines = [
         "You are a data scientist explaining what cleaning operations were applied to a dataset.",
         "Based on the structured changelog below, write a plain-English explanation.",
