@@ -7,6 +7,8 @@ import numpy as np
 import pytest
 import pandas as pd
 
+import os
+
 from agents.eda_agent import (
     compute_eda_stats,
     generate_boxplots,
@@ -14,7 +16,40 @@ from agents.eda_agent import (
     generate_eda_insights,
     generate_histograms,
     generate_target_distribution,
+    run_eda,
 )
+
+
+@pytest.fixture
+def cleaning_changelog_with_outliers() -> dict:
+    """A realistic clean_dataset() changelog with outlier_handling columns_processed.
+
+    Uses ``pclass`` (low cardinality, not ID-like) so that the outlier column is
+    *not* also excluded by ``identify_id_columns()`` — this keeps the test focused
+    on wiring, not on ID-detection interference.
+    """
+    return {
+        "duplicate_removal": {"rows_before": 14, "rows_after": 14, "duplicates_removed": 0, "duplicate_percentage": 0.0},
+        "dtype_fixing": {"columns_fixed": [], "columns_left_as_object": []},
+        "missing_value_imputation": {
+            "columns_imputed": [],
+            "columns_flagged_high_missing": [],
+            "columns_skipped_no_missing": [],
+        },
+        "outlier_handling": {
+            "columns_processed": [
+                {"column": "pclass", "outliers_capped_count": 0, "lower_bound": 1.0, "upper_bound": 3.0},
+            ],
+            "columns_skipped_low_cardinality": [],
+            "columns_skipped_target_protected": [],
+        },
+    }
+
+
+@pytest.fixture
+def cleaning_changelog_malformed() -> dict:
+    """A changelog that exists but has no outlier_handling key (e.g. a very early abort)."""
+    return {"duplicate_removal": {}, "status": "incomplete"}
 
 
 @pytest.fixture
@@ -969,3 +1004,271 @@ class TestGenerateEdaInsights:
         assert len(result["insights"]) > 0
         assert all(isinstance(i, str) for i in result["insights"])
         assert isinstance(result["summary"], str)
+
+
+# ── run_eda orchestration tests ────────────────────────────────────────────────
+
+
+class TestRunEda:
+    """Tests for run_eda().
+
+    These tests mock ``generate_eda_insights`` because Part 7's job is to verify
+    orchestration/wiring, not to re-test Part 6's LLM behaviour (already covered
+    in ``TestGenerateEdaInsights``).  Non-LLM parts (stats, histograms, heatmap,
+    boxplots, target distribution) run real code.
+    """
+
+    @pytest.fixture
+    def titanic_with_id(self) -> pd.DataFrame:
+        """Titanic-like dataset with a sequential passenger_id column."""
+        return pd.DataFrame(
+            {
+                "passenger_id": range(10),
+                "age": [22, 38, 26, 35, 28, 40, 25, 30, 45, 33],
+                "fare": [7.25, 71.28, 8.05, 53.10, 15.50, 80.00, 12.00, 22.00, 50.00, 35.00],
+                "pclass": [3, 1, 3, 1, 3, 2, 3, 2, 1, 2],
+                "survived": [0, 1, 0, 1, 0, 1, 0, 1, 1, 0],
+                "sex": ["male", "female", "male", "female", "male", "female", "male", "female", "female", "male"],
+            }
+        )
+
+    # ── Full successful runs ──────────────────────────────────────────────────
+
+    def test_full_run_with_target(self, titanic_with_id, tmp_path):
+        """All 6 keys populated, errors empty, artifact saved."""
+        mock_insights = {"insights": ["Fare is right-skewed."], "summary": "Summary."}
+        with unittest.mock.patch(
+            "agents.eda_agent.generate_eda_insights", return_value=mock_insights
+        ):
+            result = run_eda(
+                titanic_with_id,
+                target_column="survived",
+                problem_type="classification",
+                artifacts_dir=str(tmp_path),
+            )
+
+        assert result["stats"] is not None
+        assert result["histograms"] is not None
+        assert result["correlation_heatmap"] is not None
+        assert result["boxplots"] is not None
+        assert result["target_distribution"] is not None
+        assert result["insights"] == mock_insights
+        assert result["errors"] == {}
+        assert os.path.exists(result["artifact_path"])
+
+        # Verify saved file is valid JSON
+        with open(result["artifact_path"]) as f:
+            saved = json.load(f)
+        assert saved["stats"] is not None
+
+    def test_no_target_no_problem_type(self, titanic_with_id, tmp_path):
+        """target_distribution is None, all else populated."""
+        with unittest.mock.patch(
+            "agents.eda_agent.generate_eda_insights",
+            return_value={"insights": [], "summary": ""},
+        ):
+            result = run_eda(titanic_with_id, artifacts_dir=str(tmp_path))
+
+        assert result["stats"] is not None
+        assert result["histograms"] is not None
+        assert result["boxplots"] is not None
+        assert result["correlation_heatmap"] is not None
+        assert result["target_distribution"] is None
+        assert result["insights"] is not None
+
+    def test_target_only_no_problem_type(self, titanic_with_id, tmp_path):
+        """target_column provided but problem_type=None => target_distribution=None."""
+        with unittest.mock.patch(
+            "agents.eda_agent.generate_eda_insights",
+            return_value={"insights": [], "summary": ""},
+        ):
+            result = run_eda(
+                titanic_with_id, target_column="survived", artifacts_dir=str(tmp_path)
+            )
+
+        assert result["target_distribution"] is None
+        assert result["stats"] is not None  # still ran
+
+    def test_problem_type_only_no_target(self, titanic_with_id, tmp_path):
+        """problem_type provided but target_column=None => target_distribution=None."""
+        with unittest.mock.patch(
+            "agents.eda_agent.generate_eda_insights",
+            return_value={"insights": [], "summary": ""},
+        ):
+            result = run_eda(
+                titanic_with_id, problem_type="classification", artifacts_dir=str(tmp_path)
+            )
+
+        assert result["target_distribution"] is None
+        assert result["stats"] is not None
+
+    # ── Failure isolation ─────────────────────────────────────────────────────
+
+    def test_part_failure_isolation(self, titanic_with_id, tmp_path):
+        """One part raises => other parts still run, errors dict populated."""
+        with unittest.mock.patch(
+            "agents.eda_agent.generate_eda_insights",
+            return_value={"insights": [], "summary": ""},
+        ):
+            with unittest.mock.patch(
+                "agents.eda_agent.generate_correlation_heatmap",
+                side_effect=ValueError("Simulated heatmap failure"),
+            ):
+                result = run_eda(
+                    titanic_with_id,
+                    target_column="survived",
+                    problem_type="classification",
+                    artifacts_dir=str(tmp_path),
+                )
+
+        # Other parts populated
+        assert result["stats"] is not None
+        assert result["histograms"] is not None
+        assert result["boxplots"] is not None
+        assert result["target_distribution"] is not None
+        assert result["insights"] is not None
+
+        # Failed part is None with error recorded
+        assert result["correlation_heatmap"] is None
+        assert "correlation_heatmap" in result["errors"]
+        assert "Simulated heatmap failure" in result["errors"]["correlation_heatmap"]
+
+        # No other errors leaked
+        assert set(result["errors"].keys()) == {"correlation_heatmap"}
+
+    # ── Edge cases ────────────────────────────────────────────────────────────
+
+    def test_zero_numeric_columns(self, tmp_path):
+        """No numeric columns => no crash, empty/None results throughout."""
+        df = pd.DataFrame({"a": ["x", "y", "z"], "b": ["foo", "bar", "baz"]})
+
+        with unittest.mock.patch(
+            "agents.eda_agent.generate_eda_insights",
+            return_value={"insights": [], "summary": ""},
+        ):
+            result = run_eda(df, artifacts_dir=str(tmp_path))
+
+        assert result["stats"] is not None
+        # No numeric columns = empty histograms, no correlation matrix, empty boxplots
+        assert result["stats"]["skewness"] == {}
+        assert result["stats"]["distribution_stats"] == {}
+        # Correlation matrix is {} so heatmap code path skipped => None
+        assert result["correlation_heatmap"] is None
+        assert result["target_distribution"] is None
+        assert result["insights"] is not None
+        assert isinstance(result["errors"], dict)
+        assert os.path.exists(result["artifact_path"])
+
+    # ── Artifact file verification ────────────────────────────────────────────
+
+    def test_artifact_file_valid_json(self, titanic_with_id, tmp_path):
+        """Saved artifact matches the returned dict and is valid JSON."""
+        with unittest.mock.patch(
+            "agents.eda_agent.generate_eda_insights",
+            return_value={"insights": ["Insight 1"], "summary": "Summary"},
+        ):
+            result = run_eda(
+                titanic_with_id,
+                target_column="survived",
+                problem_type="classification",
+                artifacts_dir=str(tmp_path),
+            )
+
+        assert os.path.exists(result["artifact_path"])
+
+        with open(result["artifact_path"]) as f:
+            saved = json.load(f)
+
+        assert saved["excluded_columns"] == result["excluded_columns"]
+        assert saved["errors"] == result["errors"]
+        assert saved["insights"] == result["insights"]
+
+    def test_excluded_columns_populated(self, titanic_with_id, tmp_path):
+        """passenger_id is detected as ID-like column and populated in result."""
+        with unittest.mock.patch(
+            "agents.eda_agent.generate_eda_insights",
+            return_value={"insights": [], "summary": ""},
+        ):
+            result = run_eda(
+                titanic_with_id, target_column="survived", artifacts_dir=str(tmp_path)
+            )
+
+        assert "passenger_id" in result["excluded_columns"]
+
+    # ── Cleaning changelog → boxplots ────────────────────────────────────────
+
+    def test_cleaning_changelog_wired_to_boxplots(
+        self, titanic_with_id, cleaning_changelog_with_outliers, tmp_path,
+    ):
+        """Valid changelog with columns_processed → boxplots restricted to those columns."""
+        with unittest.mock.patch(
+            "agents.eda_agent.generate_eda_insights",
+            return_value={"insights": [], "summary": ""},
+        ):
+            result = run_eda(
+                titanic_with_id,
+                target_column="survived",
+                problem_type="classification",
+                artifacts_dir=str(tmp_path),
+                cleaning_changelog=cleaning_changelog_with_outliers,
+            )
+
+        assert result["boxplots"] is not None
+        box_keys = set(result["boxplots"]["boxplots"].keys())
+        # pclass is in the changelog's columns_processed and is not ID-like → should appear
+        assert "pclass" in box_keys
+        # survived is NOT in the changelog → should NOT appear
+        assert "survived" not in box_keys
+        # age/fare are ID-like → excluded even if they were in the changelog (they're not)
+
+    def test_cleaning_changelog_none_fallback(
+        self, titanic_with_id, tmp_path,
+    ):
+        """cleaning_changelog=None → default behaviour: all non-excluded numeric columns."""
+        with unittest.mock.patch(
+            "agents.eda_agent.generate_eda_insights",
+            return_value={"insights": [], "summary": ""},
+        ):
+            result = run_eda(
+                titanic_with_id,
+                target_column="survived",
+                problem_type="classification",
+                artifacts_dir=str(tmp_path),
+                cleaning_changelog=None,
+            )
+
+        assert result["boxplots"] is not None
+        box_keys = set(result["boxplots"]["boxplots"].keys())
+        # Numeric columns flagged as ID-like (100% unique in a 10-row dataset):
+        # passenger_id, age, fare — all excluded.
+        # Non-excluded numeric columns: pclass (3 uniques), survived (2 uniques).
+        assert "pclass" in box_keys
+        assert "survived" in box_keys
+        assert "passenger_id" not in box_keys
+        assert "age" not in box_keys
+        assert "fare" not in box_keys
+
+    def test_cleaning_changelog_malformed_fallback(
+        self, titanic_with_id, cleaning_changelog_malformed, tmp_path,
+    ):
+        """Malformed changelog (missing outlier_handling) → falls back, doesn't raise."""
+        with unittest.mock.patch(
+            "agents.eda_agent.generate_eda_insights",
+            return_value={"insights": [], "summary": ""},
+        ):
+            result = run_eda(
+                titanic_with_id,
+                target_column="survived",
+                problem_type="classification",
+                artifacts_dir=str(tmp_path),
+                cleaning_changelog=cleaning_changelog_malformed,
+            )
+
+        # Falls back to default behaviour: all non-excluded numeric columns
+        assert result["boxplots"] is not None
+        box_keys = set(result["boxplots"]["boxplots"].keys())
+        assert "pclass" in box_keys
+        assert "survived" in box_keys
+        assert "age" not in box_keys
+        assert "fare" not in box_keys
+        assert result["errors"] == {}

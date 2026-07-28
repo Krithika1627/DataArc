@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, TypedDict
 
@@ -8,7 +9,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 from dotenv import load_dotenv
 
-from logging_utils import with_agent_logging
+from agents.dataset_understanding import identify_id_columns
+from agents.logging_utils import with_agent_logging
 
 
 @with_agent_logging("eda_compute_stats")
@@ -559,3 +561,102 @@ def generate_boxplots(
         "boxplots": boxplots,
         "skipped_columns": skipped,
     }
+
+@with_agent_logging("eda_orchestration")
+def run_eda(
+    df: pd.DataFrame,
+    target_column: str | None = None,
+    problem_type: str | None = None,
+    artifacts_dir: str = "artifacts",
+    cleaning_changelog: dict | None = None,
+) -> dict[str, Any]:
+    id_columns = identify_id_columns(df)
+    exclude = set(id_columns)
+
+    result: dict[str, Any] = {
+        "stats": None,
+        "histograms": None,
+        "correlation_heatmap": None,
+        "boxplots": None,
+        "target_distribution": None,
+        "insights": None,
+        "excluded_columns": id_columns,
+        "errors": {},
+        "artifact_path": "",
+    }
+
+    stats: dict = {}  
+    try:
+        stats = compute_eda_stats(df, target_column, problem_type)
+        result["stats"] = stats
+    except Exception as exc:
+        result["errors"]["stats"] = str(exc)
+
+    try:
+        result["histograms"] = generate_histograms(
+            df, exclude_columns=id_columns
+        )
+    except Exception as exc:
+        result["errors"]["histograms"] = str(exc)
+
+    raw_matrix = stats.get("correlation_matrix", {})
+    if raw_matrix:
+        try:
+            filtered_matrix = {
+                col_a: {
+                    col_b: val
+                    for col_b, val in row.items()
+                    if col_b not in exclude
+                }
+                for col_a, row in raw_matrix.items()
+                if col_a not in exclude
+            }
+            if filtered_matrix:
+                result["correlation_heatmap"] = generate_correlation_heatmap(
+                    filtered_matrix
+                )
+        except Exception as exc:
+            result["errors"]["correlation_heatmap"] = str(exc)
+
+    outlier_columns: list[str] | None = None
+    if cleaning_changelog is not None:
+        outlier_handler = cleaning_changelog.get("outlier_handling", {})
+        columns_processed = outlier_handler.get("columns_processed", [])
+        if columns_processed:
+            outlier_columns = [entry["column"] for entry in columns_processed]
+
+    try:
+        result["boxplots"] = generate_boxplots(
+            df,
+            outlier_columns=outlier_columns,
+            exclude_columns=id_columns,
+        )
+    except Exception as exc:
+        result["errors"]["boxplots"] = str(exc)
+
+    if target_column is not None and problem_type is not None:
+        try:
+            result["target_distribution"] = generate_target_distribution(
+                df, target_column, problem_type,
+            )
+        except Exception as exc:
+            result["errors"]["target_distribution"] = str(exc)
+
+    if stats:
+        try:
+            result["insights"] = generate_eda_insights(
+                stats,
+                target_column=target_column,
+                problem_type=problem_type,
+                exclude_columns=id_columns,
+            )
+        except Exception as exc:
+            result["errors"]["insights"] = str(exc)
+
+    os.makedirs(artifacts_dir, exist_ok=True)
+    bundle_path = os.path.join(artifacts_dir, "eda_bundle_v1.json")
+    with open(bundle_path, "w") as f:
+        json.dump(result, f, indent=2, default=str)
+    result["artifact_path"] = os.path.abspath(bundle_path)
+
+    return result

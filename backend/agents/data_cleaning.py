@@ -8,7 +8,7 @@ from typing import TypedDict
 import pandas as pd
 from dotenv import load_dotenv
 
-from logging_utils import with_agent_logging
+from agents.logging_utils import with_agent_logging
 
 
 @with_agent_logging("duplicate_removal")

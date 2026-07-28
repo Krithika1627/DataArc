@@ -1,5 +1,7 @@
 from __future__ import annotations
 import io
+import json
+import logging
 from typing import Any, Optional
 
 import pandas as pd
@@ -11,10 +13,10 @@ from agents.dataset_understanding import (
     profile_dataset,
 )
 from agents.data_cleaning import clean_dataset
+from agents.eda_agent import run_eda
 
 
 class CleaningSummary(BaseModel):
-    """Summary of all cleaning operations performed on the dataset."""
     duplicate_removal: dict[str, Any] = Field(
         description="Duplicate removal results: rows_before, rows_after, duplicates_removed, duplicate_percentage"
     )
@@ -33,7 +35,6 @@ class CleaningSummary(BaseModel):
 
 
 class CleanDatasetResponse(BaseModel):
-    """Response from the /clean-dataset endpoint."""
     artifact_path: str = Field(
         description="Absolute path to the cleaned CSV artifact"
     )
@@ -46,7 +47,6 @@ class CleanDatasetResponse(BaseModel):
 
 
 class ColumnProfile(BaseModel):
-    """Statistics for a single column."""
     name: str = Field(description="Column name")
     dtype: str = Field(description="Pandas dtype string, e.g. 'int64'")
     missing_count: int = Field(description="Number of missing (NaN) values")
@@ -55,7 +55,6 @@ class ColumnProfile(BaseModel):
 
 
 class DatasetProfile(BaseModel):
-    """Profiling result for an uploaded dataset."""
     row_count: int = Field(description="Total number of rows")
     column_count: int = Field(description="Total number of columns")
     columns: list[ColumnProfile] = Field(description="Per-column statistics")
@@ -64,14 +63,12 @@ class DatasetProfile(BaseModel):
 
 
 class TargetCandidateResponse(BaseModel):
-    """A single target column candidate with heuristic scoring."""
     column_name: str = Field(description="Name of the candidate column")
     confidence_score: float = Field(description="Heuristic confidence score (0–100)")
     reasons: list[str] = Field(description="Plain-English reasons the column was flagged or excluded")
 
 
 class ProblemTypeAnalysis(BaseModel):
-    """LLM-generated problem-type classification and project plan."""
     problem_type: str = Field(
         description="One of: classification, regression, clustering, unclear"
     )
@@ -84,7 +81,6 @@ class ProblemTypeAnalysis(BaseModel):
 
 
 class AnalyzeDatasetResponse(BaseModel):
-    """Combined response from the /analyze-dataset endpoint."""
     profile: DatasetProfile = Field(description="Dataset profiling results")
     target_candidates: list[TargetCandidateResponse] = Field(
         description="Heuristic target candidates (always included for user review)"
@@ -97,6 +93,89 @@ class AnalyzeDatasetResponse(BaseModel):
     )
     problem_type_analysis: ProblemTypeAnalysis = Field(
         description="LLM-generated problem-type classification and project plan"
+    )
+
+
+class EDAStats(BaseModel):
+    skewness: dict[str, float] = Field(
+        description="Skewness per numeric column"
+    )
+    correlation_matrix: dict[str, dict[str, float]] = Field(
+        description="Full Pearson correlation matrix, nested by column"
+    )
+    flagged_correlations: list[dict[str, Any]] = Field(
+        description="Column pairs with |correlation| > 0.7, sorted descending"
+    )
+    distribution_stats: dict[str, dict[str, float]] = Field(
+        description="Mean/median/std/min/max per numeric column"
+    )
+    class_balance: Optional[dict[str, Any]] = Field(
+        default=None,
+        description="Class counts/percentages if classification target provided, else None",
+    )
+
+
+class HistogramsResult(BaseModel):
+    histograms: dict[str, str] = Field(
+        description="Column name to Plotly JSON string"
+    )
+    skipped_columns: list[dict[str, Any]] = Field(
+        description="Columns skipped (e.g. all-NaN), with reasons"
+    )
+
+
+class BoxplotsResult(BaseModel):
+    boxplots: dict[str, str] = Field(
+        description="Column name to Plotly JSON string"
+    )
+    skipped_columns: list[dict[str, Any]] = Field(
+        description="Columns skipped (e.g. all-NaN), with reasons"
+    )
+
+
+class EDAInsights(BaseModel):
+    insights: list[str] = Field(
+        description="Specific, quantitative LLM-generated insights"
+    )
+    summary: str = Field(
+        description="1-2 sentence overview tying insights together"
+    )
+
+
+class EDAResponse(BaseModel):
+    """Response from the run-eda endpoint."""
+    stats: Optional[EDAStats] = Field(
+        default=None,
+        description="Computed statistical summary, or None if computation failed",
+    )
+    histograms: Optional[HistogramsResult] = Field(
+        default=None,
+        description="Histogram charts, or None if generation failed",
+    )
+    correlation_heatmap: Optional[str] = Field(
+        default=None,
+        description="Correlation heatmap as Plotly JSON, or None if not generated or generation failed",
+    )
+    boxplots: Optional[BoxplotsResult] = Field(
+        default=None,
+        description="Box plot charts, or None if generation failed",
+    )
+    target_distribution: Optional[str] = Field(
+        default=None,
+        description="Target distribution chart as Plotly JSON, or None if target/problem_type not both provided, or generation failed",
+    )
+    insights: Optional[EDAInsights] = Field(
+        default=None,
+        description="LLM-generated insights, or None if stats unavailable or generation failed",
+    )
+    excluded_columns: list[str] = Field(
+        description="ID-like columns excluded from EDA"
+    )
+    errors: dict[str, str] = Field(
+        description="Part name to error message, only populated for parts that failed",
+    )
+    artifact_path: str = Field(
+        description="Path to the saved EDA bundle JSON",
     )
 
 
@@ -228,7 +307,6 @@ async def analyze_dataset(
         user_selected_target = None
 
     if user_selected_target is not None:
-        # User-provided target
         if user_selected_target not in df.columns:
             raise HTTPException(
                 status_code=400,
@@ -247,7 +325,6 @@ async def analyze_dataset(
             }
         ]
     else:
-        # Auto-detection
         selected_target = (
             target_candidates[0]["column_name"] if target_candidates else None
         )
@@ -263,3 +340,68 @@ async def analyze_dataset(
         selected_target=selected_target,
         problem_type_analysis=ProblemTypeAnalysis(**problem_type_analysis),
     )
+
+
+@app.post("/run-eda", response_model=EDAResponse)
+async def run_eda_endpoint(
+    file: UploadFile = File(...),
+    target_column: Optional[str] = Form(None),
+    problem_type: Optional[str] = Form(None),
+    cleaning_changelog_path: Optional[str] = Form(None),
+):
+    if not file.filename or not file.filename.lower().endswith(".csv"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type: '{file.filename}'. Only .csv files are accepted.",
+        )
+
+    try:
+        contents = await file.read()
+        df = pd.read_csv(io.BytesIO(contents))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to parse CSV file: {exc}",
+        )
+
+    if len(df) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="CSV has headers but no data rows. Please upload a dataset with at least one row.",
+        )
+
+    if target_column is not None and target_column.strip() == "":
+        target_column = None
+
+    if problem_type is not None and problem_type.strip() == "":
+        problem_type = None
+
+    if target_column is not None:
+        if target_column not in df.columns:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Target column '{target_column}' was not found "
+                    f"in the dataset. Available columns: {sorted(str(c) for c in df.columns)}"
+                ),
+            )
+
+    cleaning_changelog: dict | None = None
+    if cleaning_changelog_path is not None and cleaning_changelog_path.strip():
+        try:
+            with open(cleaning_changelog_path) as f:
+                cleaning_changelog = json.load(f)
+        except Exception as exc:
+            logging.warning(
+                "Failed to load cleaning_changelog_path=%s: %s",
+                cleaning_changelog_path, exc,
+            )
+
+    result = run_eda(
+        df,
+        target_column=target_column,
+        problem_type=problem_type,
+        cleaning_changelog=cleaning_changelog,
+    )
+
+    return EDAResponse(**result)
