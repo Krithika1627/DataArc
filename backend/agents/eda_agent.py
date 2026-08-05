@@ -13,6 +13,45 @@ from agents.dataset_understanding import identify_id_columns
 from agents.logging_utils import with_agent_logging
 
 
+def compute_correlation_pairs(
+    df: pd.DataFrame,
+    threshold: float = 0.7,
+) -> tuple[dict[str, dict[str, float]], list[dict[str, Any]]]:
+    """Compute the Pearson correlation matrix and flag pairs above a threshold."""
+    correlation_matrix: dict[str, dict[str, float]] = {}
+    flagged_correlations: list[dict[str, Any]] = []
+
+    numeric_df = df.select_dtypes(include=["number"])
+    if numeric_df.empty:
+        return correlation_matrix, flagged_correlations
+
+    corr = numeric_df.corr(numeric_only=True)
+    correlation_matrix = {
+        str(col): {str(c): round(float(v), 4) for c, v in row.items()}
+        for col, row in corr.iterrows()
+    }
+
+    pairs: list[dict[str, Any]] = []
+    cols_list = numeric_df.columns.tolist()
+    for i, col_a in enumerate(cols_list):
+        for j, col_b in enumerate(cols_list):
+            if j <= i:
+                continue
+            val = corr.loc[col_a, col_b]
+            if pd.notna(val) and abs(val) > threshold:
+                pairs.append(
+                    {
+                        "col_a": str(col_a),
+                        "col_b": str(col_b),
+                        "correlation": round(float(val), 4),
+                    }
+                )
+    pairs.sort(key=lambda p: abs(p["correlation"]), reverse=True)
+    flagged_correlations = pairs
+
+    return correlation_matrix, flagged_correlations
+
+
 @with_agent_logging("eda_compute_stats")
 def compute_eda_stats(
     df: pd.DataFrame,
@@ -42,34 +81,10 @@ def compute_eda_stats(
             if pd.notna(val)
         }
 
-    # Correlation matrix + flagged pairs
-    correlation_matrix: dict[str, dict[str, float]] = {}
-    flagged_correlations: list[dict[str, Any]] = []
-
-    if not numeric_df.empty:
-        corr = numeric_df.corr(numeric_only=True)
-        correlation_matrix = {
-            str(col): {str(c): round(float(v), 4) for c, v in row.items()}
-            for col, row in corr.iterrows()
-        }
-
-        pairs: list[dict[str, Any]] = []
-        cols_list = numeric_df.columns.tolist()
-        for i, col_a in enumerate(cols_list):
-            for j, col_b in enumerate(cols_list):
-                if j <= i:
-                    continue  
-                val = corr.loc[col_a, col_b]
-                if pd.notna(val) and abs(val) > 0.7:
-                    pairs.append(
-                        {
-                            "col_a": str(col_a),
-                            "col_b": str(col_b),
-                            "correlation": round(float(val), 4),
-                        }
-                    )
-        pairs.sort(key=lambda p: abs(p["correlation"]), reverse=True)
-        flagged_correlations = pairs
+    # Correlation matrix + flagged pairs (shared logic reused by Week 4)
+    correlation_matrix, flagged_correlations = compute_correlation_pairs(
+        df, threshold=0.7
+    )
 
     # Basic distribution stats
     distribution_stats: dict[str, dict[str, float]] = {}
@@ -90,7 +105,8 @@ def compute_eda_stats(
     class_balance: dict[str, Any] | None = None
     if (
         target_column is not None
-        and problem_type == "classification"
+        and problem_type is not None
+        and problem_type.strip().lower() == "classification"
     ):
         counts = df[target_column].value_counts()
         percentages = df[target_column].value_counts(normalize=True) * 100
@@ -259,7 +275,10 @@ def generate_target_distribution(
             "Cannot generate a distribution chart with no valid data."
         )
 
-    if problem_type == "classification":
+    if (
+        problem_type is not None
+        and problem_type.strip().lower() == "classification"
+    ):
         series = df[target_column].dropna()
         unique_vals = series.nunique()
 
@@ -291,7 +310,10 @@ def generate_target_distribution(
             xaxis_title=target_column,
         )
 
-    elif problem_type == "regression":
+    elif (
+        problem_type is not None
+        and problem_type.strip().lower() == "regression"
+    ):
         series = df[target_column].dropna()
         unique_vals = series.nunique()
 
