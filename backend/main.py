@@ -2,10 +2,13 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
+import pickle
+import time
 from typing import Any, Optional
 
 import pandas as pd
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Body
 from pydantic import BaseModel, Field
 from agents.dataset_understanding import (
     classify_problem_type,
@@ -14,6 +17,8 @@ from agents.dataset_understanding import (
 )
 from agents.data_cleaning import clean_dataset
 from agents.eda_agent import run_eda
+from agents.feature_engineering_agent import build_feature_pipeline
+from agents.logging_utils import log_agent_run
 
 
 class CleaningSummary(BaseModel):
@@ -140,6 +145,26 @@ class EDAInsights(BaseModel):
     summary: str = Field(
         description="1-2 sentence overview tying insights together"
     )
+
+
+class CollinearPair(BaseModel):
+    col_a: str
+    col_b: str
+    correlation: float = Field(description="Pearson correlation between col_a and col_b")
+
+
+class FeatureEngineeringResponse(BaseModel):
+    """Response from /run-feature-engineering and /apply-collinearity-drop."""
+    encoding_map: dict[str, str] = Field(description="Column name to transformation applied: onehot, label, ordinal, scaled, or excluded")
+    collinear_pairs: list[CollinearPair] = Field(description="Column pairs with |correlation| > threshold; flagged only, not auto-dropped")
+    excluded_columns: list[str] = Field(description="ID-like columns, target column, and caller-supplied exclusions")
+    artifact_path: str = Field(description="Path to the saved feature-engineered CSV for this version")
+    pipeline_path: str = Field(description="Path to the pickled sklearn Pipeline object, reusable in Week 5")
+
+
+class ApplyCollinearityDropRequest(BaseModel):
+    artifact_path: str = Field(description="Path to an existing feature_engineered_vN.csv")
+    columns_to_drop: list[str] = Field(description="Columns to remove from the feature matrix")
 
 
 class EDAResponse(BaseModel):
@@ -405,3 +430,291 @@ async def run_eda_endpoint(
     )
 
     return EDAResponse(**result)
+
+
+def _next_artifact_version(artifacts_dir: str, prefix: str) -> int:
+    """Return the next unused version number for a given prefix in artifacts_dir."""
+    os.makedirs(artifacts_dir, exist_ok=True)
+    existing = [f for f in os.listdir(artifacts_dir) if f.startswith(prefix) and f.endswith(".csv")]
+    versions = []
+    for f in existing:
+        try:
+            v = int(f.replace(prefix, "").replace(".csv", "").lstrip("v"))
+            versions.append(v)
+        except (ValueError, IndexError):
+            continue
+    return max(versions, default=0) + 1
+
+
+def _next_csv_version_from_path(artifact_path: str) -> int:
+    """Determine the next version number based on an existing artifact_path."""
+    basename = os.path.basename(artifact_path)
+    for prefix in ("feature_engineered_v",):
+        if basename.startswith(prefix) and basename.endswith(".csv"):
+            try:
+                v = int(basename.replace(prefix, "").replace(".csv", ""))
+                return v + 1
+            except (ValueError, IndexError):
+                continue
+    return 1
+
+
+@app.post("/run-feature-engineering", response_model=FeatureEngineeringResponse)
+async def run_feature_engineering_endpoint(
+    file: UploadFile = File(...),
+    target_column: str = Form(...),
+    problem_type: Optional[str] = Form(...),
+    exclude_columns: Optional[str] = Form(None),
+    ordinal_columns: Optional[str] = Form(None),
+    cleaning_changelog_path: Optional[str] = Form(None),
+):
+    if not file.filename or not file.filename.lower().endswith(".csv"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type: '{file.filename}'. Only .csv files are accepted.",
+        )
+
+    try:
+        contents = await file.read()
+        df = pd.read_csv(io.BytesIO(contents))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to parse CSV file: {exc}",
+        )
+
+    if len(df) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="CSV has headers but no data rows. Please upload a dataset with at least one row.",
+        )
+
+    if target_column not in df.columns:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Target column '{target_column}' not found in cleaned dataset. "
+                f"Available columns: {sorted(str(c) for c in df.columns)}"
+            ),
+        )
+
+    exclude_list: list[str] | None = None
+    if exclude_columns and exclude_columns.strip():
+        try:
+            exclude_list = json.loads(exclude_columns)
+            if not isinstance(exclude_list, list):
+                raise ValueError("exclude_columns must be a JSON list")
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid exclude_columns JSON: {exc}",
+            )
+
+    ordinal_map: dict[str, list[str]] | None = None
+    if ordinal_columns and ordinal_columns.strip():
+        try:
+            ordinal_map = json.loads(ordinal_columns)
+            if not isinstance(ordinal_map, dict):
+                raise ValueError("ordinal_columns must be a JSON dict")
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid ordinal_columns JSON: {exc}",
+            )
+
+    cleaning_changelog: dict | None = None
+    if cleaning_changelog_path and cleaning_changelog_path.strip():
+        try:
+            with open(cleaning_changelog_path) as f:
+                cleaning_changelog = json.load(f)
+        except Exception as exc:
+            logging.warning(
+                "Failed to load cleaning_changelog_path=%s: %s",
+                cleaning_changelog_path, exc,
+            )
+
+    additional_excludes = list(exclude_list or [])
+    if cleaning_changelog:
+        outlier_skipped = cleaning_changelog.get("outlier_handling", {}).get(
+            "columns_skipped_target_protected", []
+        )
+        for item in outlier_skipped:
+            if isinstance(item, dict) and "column" in item:
+                additional_excludes.append(item["column"])
+            elif isinstance(item, str):
+                additional_excludes.append(item)
+
+    additional_excludes = list(dict.fromkeys(additional_excludes))
+
+    start = time.perf_counter()
+    try:
+        result = build_feature_pipeline(
+            df,
+            target_column=target_column,
+            problem_type=problem_type,
+            exclude_columns=additional_excludes,
+            ordinal_columns=ordinal_map,
+        )
+    except Exception as exc:
+        duration = time.perf_counter() - start
+        log_agent_run(
+            agent_name="feature_engineering",
+            inputs_summary={
+                "target_column": target_column,
+                "problem_type": problem_type,
+            },
+            outputs_summary={},
+            duration_seconds=duration,
+            error=str(exc),
+        )
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    duration = time.perf_counter() - start
+
+    artifacts_dir = "artifacts"
+    os.makedirs(artifacts_dir, exist_ok=True)
+    version = _next_artifact_version(artifacts_dir, "feature_engineered_v")
+    csv_path = os.path.join(artifacts_dir, f"feature_engineered_v{version}.csv")
+    pkl_path = os.path.join(artifacts_dir, f"pipeline_v{version}.pkl")
+
+    result["transformed_df"].to_csv(csv_path, index=False)
+    with open(pkl_path, "wb") as f:
+        pickle.dump(result["pipeline"], f)
+
+    meta_json_path = os.path.join(artifacts_dir, f"pipeline_v{version}.json")
+    collinear_pairs_dicts = [
+        {"col_a": p["col_a"], "col_b": p["col_b"], "correlation": p["correlation"]}
+        for p in result["collinear_pairs"]
+    ]
+    with open(meta_json_path, "w") as f:
+        json.dump({
+            "encoding_map": result["encoding_map"],
+            "collinear_pairs": collinear_pairs_dicts,
+            "excluded_columns": result["excluded_columns"],
+        }, f)
+
+    log_agent_run(
+        agent_name="feature_engineering",
+        inputs_summary={
+            "target_column": target_column,
+            "problem_type": problem_type,
+            "rows": len(df),
+            "columns": len(df.columns),
+        },
+        outputs_summary={
+            "encoding_map": result["encoding_map"],
+            "collinear_pairs_count": len(result["collinear_pairs"]),
+            "excluded_columns": result["excluded_columns"],
+            "artifact_path": csv_path,
+            "pipeline_path": pkl_path,
+        },
+        duration_seconds=duration,
+    )
+
+    return FeatureEngineeringResponse(
+        encoding_map=result["encoding_map"],
+        collinear_pairs=[CollinearPair(**p) for p in result["collinear_pairs"]],
+        excluded_columns=result["excluded_columns"],
+        artifact_path=csv_path,
+        pipeline_path=pkl_path,
+    )
+
+
+@app.post("/apply-collinearity-drop", response_model=FeatureEngineeringResponse)
+async def apply_collinearity_drop_endpoint(
+    request: ApplyCollinearityDropRequest = Body(...),
+):
+    start = time.perf_counter()
+
+    if not os.path.isfile(request.artifact_path):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Feature-engineered artifact not found: '{request.artifact_path}'",
+        )
+
+    try:
+        df = pd.read_csv(request.artifact_path)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to parse feature-engineered CSV: {exc}",
+        )
+
+    missing_cols = [c for c in request.columns_to_drop if c not in df.columns]
+    if missing_cols:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Columns not found in artifact: {missing_cols}",
+        )
+
+    next_version = _next_csv_version_from_path(request.artifact_path)
+    artifacts_dir = os.path.dirname(request.artifact_path) or "artifacts"
+    csv_path = os.path.join(artifacts_dir, f"feature_engineered_v{next_version}.csv")
+    pkl_path = os.path.join(artifacts_dir, f"pipeline_v{next_version}.pkl")
+
+    df_dropped = df.drop(columns=request.columns_to_drop)
+    df_dropped.to_csv(csv_path, index=False)
+
+    orig_pipeline_version = None
+    basename = os.path.basename(request.artifact_path)
+    for prefix in ("feature_engineered_v",):
+        if basename.startswith(prefix) and basename.endswith(".csv"):
+            try:
+                orig_pipeline_version = int(basename.replace(prefix, "").replace(".csv", ""))
+            except (ValueError, IndexError):
+                pass
+
+    if orig_pipeline_version is not None:
+        orig_pkl_path = os.path.join(artifacts_dir, f"pipeline_v{orig_pipeline_version}.pkl")
+        if os.path.isfile(orig_pkl_path):
+            with open(orig_pkl_path, "rb") as f:
+                orig_pipeline = pickle.load(f)
+            with open(pkl_path, "wb") as f:
+                pickle.dump(orig_pipeline, f)
+
+    meta_json_path = os.path.join(artifacts_dir, f"pipeline_v{next_version}.json")
+    meta_path_for_orig = os.path.join(artifacts_dir, f"pipeline_v{orig_pipeline_version}.json") if orig_pipeline_version else None
+
+    orig_meta = {}
+    if meta_path_for_orig and os.path.isfile(meta_path_for_orig):
+        with open(meta_path_for_orig) as f:
+            orig_meta = json.load(f)
+
+    new_encoding_map = dict(orig_meta.get("encoding_map", {}))
+    for col in request.columns_to_drop:
+        new_encoding_map[col] = "dropped"
+
+    new_meta = {
+        "encoding_map": new_encoding_map,
+        "collinear_pairs": orig_meta.get("collinear_pairs", []),
+        "excluded_columns": orig_meta.get("excluded_columns", []),
+    }
+    with open(meta_json_path, "w") as f:
+        json.dump(new_meta, f)
+
+    collinear_pairs = [
+        CollinearPair(**p) for p in orig_meta.get("collinear_pairs", [])
+    ]
+    excluded_columns = list(dict.fromkeys(orig_meta.get("excluded_columns", [])))
+
+    duration = time.perf_counter() - start
+    log_agent_run(
+        agent_name="collinearity_drop",
+        inputs_summary={
+            "artifact_path": request.artifact_path,
+            "columns_to_drop": request.columns_to_drop,
+        },
+        outputs_summary={
+            "artifact_path": csv_path,
+            "columns_dropped": request.columns_to_drop,
+        },
+        duration_seconds=duration,
+    )
+
+    return FeatureEngineeringResponse(
+        encoding_map=new_encoding_map,
+        collinear_pairs=collinear_pairs,
+        excluded_columns=excluded_columns,
+        artifact_path=csv_path,
+        pipeline_path=pkl_path if os.path.isfile(pkl_path) else "",
+    )
