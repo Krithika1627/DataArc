@@ -62,12 +62,23 @@ def identify_id_columns(df: pd.DataFrame, threshold: float = 0.95) -> list[str]:
 @with_agent_logging("target_detection")
 def detect_target_candidates(df: pd.DataFrame, return_all: bool = False) -> list[dict]:
     target_keywords = {"target", "label", "class", "y", "outcome", "result"}
-    outcome_keywords = {"score", "price", "amount", "value", "rating", "revenue", "salary", "cost"}
+    domain_target_keywords = {
+        "survived", "churn", "default", "approved", "fraud", "response",
+        "converted", "purchased", "diagnosis", "readmitted", "attrition",
+        "loan_status", "status", "success", "failure"
+    }
+    outcome_keywords = {
+        "score", "price", "amount", "value", "rating", "revenue", "salary", "cost",
+        "grade", "gpa", "mark", "marks"
+    }
+    boolean_like_sets = [
+        {"0", "1"}, {"true", "false"}, {"yes", "no"}, {"y", "n"}
+    ]
+
     row_count = len(df)
     col_count = len(df.columns)
     all_scores = []
 
-    # Identify ID-like columns once, reusable across the loop
     id_columns = identify_id_columns(df)
 
     for i, col in enumerate(df.columns):
@@ -77,20 +88,28 @@ def detect_target_candidates(df: pd.DataFrame, return_all: bool = False) -> list
 
         normalized = col_name.lower().replace("_", "").replace(" ", "")
 
-        # Name match (+40)
         if normalized in target_keywords:
             score += 40
             reasons.append("Column name matches common target naming pattern")
+        elif any(kw in normalized for kw in domain_target_keywords):
+            score += 35
+            reasons.append("Column name matches a common domain-specific target pattern")
 
-        # Low-to-moderate cardinality (+30, classification signal)
         unique_count = int(df[col].nunique())
-        if row_count >= 10 and 2 <= unique_count <= 10:
+        distinct_vals = set(
+            str(v).strip().lower() for v in df[col].dropna().unique()
+        )
+        is_boolean_like = len(distinct_vals) == 2 and any(distinct_vals == b for b in boolean_like_sets)
+
+        if is_boolean_like:
+            score += 25
+            reasons.append("Column contains boolean-like values, a strong binary-target signal")
+        elif row_count >= 10 and 2 <= unique_count <= 10:
             score += 30
             reasons.append(
                 f"Low cardinality ({unique_count} unique values) suggests a classification target"
             )
 
-        # Combined last-column rule 
         is_last = i == col_count - 1
         is_numeric = str(df[col].dtype) in ("int64", "float64")
         high_cardinality = unique_count > 10
@@ -101,15 +120,13 @@ def detect_target_candidates(df: pd.DataFrame, return_all: bool = False) -> list
                 "Last column, numeric, high cardinality -- strong regression target signal"
             )
         elif is_last:
-            score += 15
-            reasons.append("Column is the last column in the dataset (common target convention)")
+            score += 5
+            reasons.append("Column is the last column in the dataset (weak target convention signal)")
 
-        # Outcome keyword bonus (+20)
         if any(kw in col_name.lower() for kw in outcome_keywords):
             score += 20
             reasons.append("Column name contains a common outcome/target keyword")
 
-        # ID column penalty (-30)
         if col_name in id_columns:
             score -= 30
             reasons.append(
@@ -124,10 +141,19 @@ def detect_target_candidates(df: pd.DataFrame, return_all: bool = False) -> list
                 "column_name": col_name,
                 "confidence_score": score,
                 "reasons": reasons,
+                "_is_numeric": is_numeric,      
+                "_unique_count": unique_count,  
             }
         )
 
-    all_scores.sort(key=lambda c: c["confidence_score"], reverse=True)
+    all_scores.sort(
+        key=lambda c: (c["confidence_score"], c["_is_numeric"], c["_unique_count"]),
+        reverse=True,
+    )
+
+    for c in all_scores:
+        del c["_is_numeric"]
+        del c["_unique_count"]
 
     if return_all:
         return all_scores
