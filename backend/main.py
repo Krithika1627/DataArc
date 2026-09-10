@@ -18,7 +18,9 @@ from agents.dataset_understanding import (
 from agents.data_cleaning import clean_dataset
 from agents.eda_agent import run_eda
 from agents.feature_engineering_agent import build_feature_pipeline
+from agents.ml_planning_agent import MLPlanningAgent
 from agents.logging_utils import log_agent_run
+from agents.versioning_utils import get_next_version, save_artifact, get_latest_version_path
 
 
 class CleaningSummary(BaseModel):
@@ -358,6 +360,15 @@ async def analyze_dataset(
 
     problem_type_analysis = classify_problem_type(profile, llm_candidates)
 
+    saved_profile_payload = {
+        "profile": profile,
+        "target_candidates": target_candidates,
+        "target_source": target_source,
+        "selected_target": selected_target,
+        "problem_type_analysis": problem_type_analysis,
+    }
+    save_artifact(saved_profile_payload, "artifacts", "dataset_profile", "json")
+
     return AnalyzeDatasetResponse(
         profile=DatasetProfile(**profile),
         target_candidates=[TargetCandidateResponse(**c) for c in target_candidates],
@@ -573,25 +584,33 @@ async def run_feature_engineering_endpoint(
 
     artifacts_dir = "artifacts"
     os.makedirs(artifacts_dir, exist_ok=True)
-    version = _next_artifact_version(artifacts_dir, "feature_engineered_v")
+    version = get_next_version(artifacts_dir, "feature_engineered")
     csv_path = os.path.join(artifacts_dir, f"feature_engineered_v{version}.csv")
+    json_path = os.path.join(artifacts_dir, f"feature_engineered_v{version}.json")
     pkl_path = os.path.join(artifacts_dir, f"pipeline_v{version}.pkl")
+    meta_json_path = os.path.join(artifacts_dir, f"pipeline_v{version}.json")
 
     result["transformed_df"].to_csv(csv_path, index=False)
     with open(pkl_path, "wb") as f:
         pickle.dump(result["pipeline"], f)
 
-    meta_json_path = os.path.join(artifacts_dir, f"pipeline_v{version}.json")
     collinear_pairs_dicts = [
         {"col_a": p["col_a"], "col_b": p["col_b"], "correlation": p["correlation"]}
         for p in result["collinear_pairs"]
     ]
+    fe_summary = {
+        "columns": list(result["transformed_df"].columns),
+        "dtypes": {str(c): str(t) for c, t in result["transformed_df"].dtypes.items()},
+        "target_column": target_column,
+        "problem_type": problem_type,
+        "encoding_map": result["encoding_map"],
+        "collinear_pairs": collinear_pairs_dicts,
+        "excluded_columns": result["excluded_columns"],
+    }
+    with open(json_path, "w") as f:
+        json.dump(fe_summary, f, indent=2, default=str)
     with open(meta_json_path, "w") as f:
-        json.dump({
-            "encoding_map": result["encoding_map"],
-            "collinear_pairs": collinear_pairs_dicts,
-            "excluded_columns": result["excluded_columns"],
-        }, f)
+        json.dump(fe_summary, f, indent=2, default=str)
 
     log_agent_run(
         agent_name="feature_engineering",
@@ -673,6 +692,7 @@ async def apply_collinearity_drop_endpoint(
                 pickle.dump(orig_pipeline, f)
 
     meta_json_path = os.path.join(artifacts_dir, f"pipeline_v{next_version}.json")
+    fe_json_path = os.path.join(artifacts_dir, f"feature_engineered_v{next_version}.json")
     meta_path_for_orig = os.path.join(artifacts_dir, f"pipeline_v{orig_pipeline_version}.json") if orig_pipeline_version else None
 
     orig_meta = {}
@@ -685,11 +705,17 @@ async def apply_collinearity_drop_endpoint(
         new_encoding_map[col] = "dropped"
 
     new_meta = {
+        "columns": list(df_dropped.columns),
+        "dtypes": {str(c): str(t) for c, t in df_dropped.dtypes.items()},
+        "target_column": orig_meta.get("target_column"),
+        "problem_type": orig_meta.get("problem_type"),
         "encoding_map": new_encoding_map,
         "collinear_pairs": orig_meta.get("collinear_pairs", []),
         "excluded_columns": orig_meta.get("excluded_columns", []),
     }
     with open(meta_json_path, "w") as f:
+        json.dump(new_meta, f)
+    with open(fe_json_path, "w") as f:
         json.dump(new_meta, f)
 
     collinear_pairs = [
@@ -718,3 +744,81 @@ async def apply_collinearity_drop_endpoint(
         artifact_path=csv_path,
         pipeline_path=pkl_path if os.path.isfile(pkl_path) else "",
     )
+
+
+class CandidateModelResponse(BaseModel):
+    model_name: str = Field(description="Name of candidate ML model")
+    reasoning: str = Field(description="Why this model fits the dataset")
+
+
+class MLPlanResponse(BaseModel):
+    problem_type: str = Field(
+        description="Confirmed problem type: classification or regression"
+    )
+    confirmation_reasoning: str = Field(
+        description="1-2 sentence justification for the problem type"
+    )
+    recommended_metric: str = Field(
+        description="Primary evaluation metric suited for the dataset"
+    )
+    metric_reasoning: str = Field(
+        description="1-2 sentence justification for the selected metric"
+    )
+    candidate_models: list[CandidateModelResponse] = Field(
+        description="4-6 candidate models with reasoning"
+    )
+
+
+class PlanTrainingRequest(BaseModel):
+    state: Optional[dict[str, Any]] = Field(
+        default=None, description="Shared pipeline state dictionary from earlier stages"
+    )
+    target_column: Optional[str] = Field(
+        default=None, description="Target column name"
+    )
+    problem_type: Optional[str] = Field(
+        default=None, description="Initial problem type guess"
+    )
+    profile: Optional[dict[str, Any]] = Field(
+        default=None, description="Dataset profile dictionary"
+    )
+    class_balance: Optional[dict[str, Any]] = Field(
+        default=None, description="Class balance dictionary"
+    )
+    feature_engineering_summary: Optional[dict[str, Any]] = Field(
+        default=None, description="Feature engineering metadata"
+    )
+
+
+@app.post("/plan-training", response_model=MLPlanResponse)
+@app.post("/plan-ml", response_model=MLPlanResponse)
+async def plan_training_endpoint(
+    request: dict[str, Any] = Body(...),
+):
+    try:
+        if "state" in request and isinstance(request["state"], dict):
+            state_dict = dict(request["state"])
+        else:
+            state_dict = dict(request)
+
+        agent = MLPlanningAgent()
+        result_state = agent.run(state_dict)
+        plan = result_state.get("ml_plan")
+        if not plan:
+            raise ValueError("MLPlanningAgent did not produce an 'ml_plan' in state.")
+
+        return MLPlanResponse(
+            problem_type=plan["problem_type"],
+            confirmation_reasoning=plan["confirmation_reasoning"],
+            recommended_metric=plan["recommended_metric"],
+            metric_reasoning=plan["metric_reasoning"],
+            candidate_models=[
+                CandidateModelResponse(**m) for m in plan["candidate_models"]
+            ],
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+

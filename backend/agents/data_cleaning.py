@@ -37,15 +37,16 @@ def remove_duplicates(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
 def save_versioned_artifact(
     df: pd.DataFrame,
     stage_name: str,
-    version: int = 1,
+    version: int | None = None,
     artifacts_dir: str = "artifacts",
 ) -> str:
     """Save a DataFrame as a versioned CSV file inside the artifacts directory"""
-    os.makedirs(artifacts_dir, exist_ok=True)
-    file_name = f"{stage_name}_v{version}.csv"
-    file_path = os.path.join(artifacts_dir, file_name)
-    df.to_csv(file_path, index=False)
-    return os.path.abspath(file_path)
+    try:
+        from agents.versioning_utils import save_artifact
+    except ImportError:
+        from versioning_utils import save_artifact
+
+    return save_artifact(df, artifacts_dir, stage_name, "csv", version=version)
 
 
 class _CleaningExplanationResponse(TypedDict):
@@ -544,12 +545,19 @@ def clean_dataset(
 
     explanation = generate_cleaning_explanation(combined_summary)
 
+    try:
+        from agents.versioning_utils import get_next_version
+    except ImportError:
+        from versioning_utils import get_next_version
+
+    version = get_next_version(artifacts_dir, "cleaned")
+
     artifact_path = save_versioned_artifact(
-        cleaned_df, "cleaned", version=1, artifacts_dir=artifacts_dir,
+        cleaned_df, "cleaned", version=version, artifacts_dir=artifacts_dir,
     )
 
     os.makedirs(artifacts_dir, exist_ok=True)
-    changelog_name = "cleaned_v1_changelog.json"
+    changelog_name = f"cleaned_v{version}_changelog.json"
     changelog_path = os.path.join(artifacts_dir, changelog_name)
 
     changelog_to_save = combined_summary.copy()

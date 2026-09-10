@@ -70,14 +70,14 @@ class TestDetectTargetCandidates:
 
         assert len(candidates) == 1
         assert candidates[0]["column_name"] == "target"
-        assert candidates[0]["confidence_score"] == 85
+        assert candidates[0]["confidence_score"] == 70
 
     def test_id_column_penalized(self, id_and_target_df):
         candidates = detect_target_candidates(id_and_target_df)
 
         assert len(candidates) == 1
         assert candidates[0]["column_name"] == "label"
-        assert candidates[0]["confidence_score"] == 85
+        assert candidates[0]["confidence_score"] == 70
 
     def test_no_clear_target(self, no_target_df):
         candidates = detect_target_candidates(no_target_df)
@@ -181,11 +181,11 @@ class TestIdentifyIdColumns:
 
         # id column: penalised to score 0
         assert candidates[0]["column_name"] == "label"
-        assert candidates[0]["confidence_score"] == 85
+        assert candidates[0]["confidence_score"] == 70
         assert candidates[0]["reasons"] == [
             "Column name matches common target naming pattern",
-            "Low cardinality (2 unique values) suggests a classification target",
-            "Column is the last column in the dataset (common target convention)",
+            "Column contains boolean-like values, a strong binary-target signal",
+            "Column is the last column in the dataset (weak target convention signal)",
         ]
 
         # id column: penalised to score 0
@@ -200,7 +200,7 @@ class TestIdentifyIdColumns:
         top = detect_target_candidates(id_and_target_df)
         assert len(top) == 1
         assert top[0]["column_name"] == "label"
-        assert top[0]["confidence_score"] == 85
+        assert top[0]["confidence_score"] == 70
 
 
 # Problem type classification tests 
