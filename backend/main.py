@@ -12,7 +12,9 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Body
 from pydantic import BaseModel, Field
 from agents.dataset_understanding import (
     classify_problem_type,
+    compute_confidence_score,
     detect_target_candidates,
+    determine_heuristic_problem_type,
     profile_dataset,
 )
 from agents.data_cleaning import clean_dataset
@@ -88,6 +90,17 @@ class ProblemTypeAnalysis(BaseModel):
     )
 
 
+class ConfidenceBreakdownItem(BaseModel):
+    check: str = Field(description="Name of the confidence check")
+    points_awarded: int = Field(description="Points awarded for this check (0, 20, 30)")
+    reason: str = Field(description="Evidence or justification for points awarded")
+
+
+class ConfidenceScoreResponse(BaseModel):
+    total_score: int = Field(description="Total confidence score (0-100)")
+    breakdown: list[ConfidenceBreakdownItem] = Field(description="Per-check points and reasons breakdown")
+
+
 class AnalyzeDatasetResponse(BaseModel):
     profile: DatasetProfile = Field(description="Dataset profiling results")
     target_candidates: list[TargetCandidateResponse] = Field(
@@ -101,6 +114,9 @@ class AnalyzeDatasetResponse(BaseModel):
     )
     problem_type_analysis: ProblemTypeAnalysis = Field(
         description="LLM-generated problem-type classification and project plan"
+    )
+    confidence_score: Optional[ConfidenceScoreResponse] = Field(
+        default=None, description="Deterministic confidence score breakdown"
     )
 
 
@@ -360,6 +376,25 @@ async def analyze_dataset(
         llm_candidates = target_candidates
 
     problem_type_analysis = classify_problem_type(profile, llm_candidates)
+    all_candidates = detect_target_candidates(df, return_all=True)
+
+    if selected_target:
+        heuristic_type = determine_heuristic_problem_type(df, selected_target)
+        confidence_score = compute_confidence_score(
+            selected_target=selected_target,
+            target_candidates=all_candidates,
+            df=df,
+            llm_problem_type=problem_type_analysis.get("problem_type", "unclear"),
+            heuristic_problem_type=heuristic_type,
+        )
+    else:
+        confidence_score = compute_confidence_score(
+            selected_target="",
+            target_candidates=[],
+            df=df,
+            llm_problem_type="unclear",
+            heuristic_problem_type="unclear",
+        )
 
     saved_profile_payload = {
         "profile": profile,
@@ -367,6 +402,7 @@ async def analyze_dataset(
         "target_source": target_source,
         "selected_target": selected_target,
         "problem_type_analysis": problem_type_analysis,
+        "confidence_score": confidence_score,
     }
     save_artifact(saved_profile_payload, "artifacts", "dataset_profile", "json")
 
@@ -376,6 +412,10 @@ async def analyze_dataset(
         target_source=target_source,
         selected_target=selected_target,
         problem_type_analysis=ProblemTypeAnalysis(**problem_type_analysis),
+        confidence_score=ConfidenceScoreResponse(
+            total_score=confidence_score["total_score"],
+            breakdown=[ConfidenceBreakdownItem(**b) for b in confidence_score["breakdown"]],
+        ),
     )
 
 
@@ -794,7 +834,6 @@ class PlanTrainingRequest(BaseModel):
     )
 
 
-@app.post("/plan-training", response_model=MLPlanResponse)
 @app.post("/plan-ml", response_model=MLPlanResponse)
 async def plan_training_endpoint(
     request: dict[str, Any] = Body(default_factory=dict),
@@ -851,7 +890,6 @@ class TrainModelsResponse(BaseModel):
     summary: TrainingSummaryResponse = Field(description="Overall training run summary")
 
 
-@app.post("/train-models", response_model=TrainModelsResponse)
 @app.post("/train", response_model=TrainModelsResponse)
 async def train_models_endpoint(
     request: dict[str, Any] = Body(default_factory=dict),

@@ -273,3 +273,228 @@ class TestClassifyProblemType:
         assert result["problem_type"] == "unclear"
         assert "GEMINI_API_KEY is not set" in result["confidence_reasoning"]
         assert "Unable to generate" in result["project_plan"]
+
+
+class TestComputeConfidenceScore:
+    """Test suite for deterministic confidence scoring in Dataset Understanding (Week 6 Part 1)."""
+
+    @pytest.fixture
+    def titanic_data(self) -> pd.DataFrame:
+        n = 100
+        return pd.DataFrame(
+            {
+                "PassengerId": range(1, n + 1),
+                "Name": [f"Passenger_{i}" for i in range(n)],
+                "Age": [22.0 + (i % 40) for i in range(n)],
+                "Fare": [7.25 + (i % 50) for i in range(n)],
+                "Sex": ["male", "female"] * (n // 2),
+                "Embarked": (["S", "C", "Q"] * (n // 3 + 1))[:n],
+                "Survived": [0, 1] * (n // 2),
+            }
+        )
+
+    def test_full_marks_titanic(self, titanic_data):
+        """1. Full-marks test on Titanic fixture: domain keyword match (+30), boolean-like (+30),
+        reasonable class balance (+20), and LLM agreement (+20) -> total_score == 100."""
+        from agents.dataset_understanding import (
+            compute_confidence_score,
+            detect_target_candidates,
+            determine_heuristic_problem_type,
+        )
+
+        candidates = detect_target_candidates(titanic_data, return_all=True)
+        heuristic_type = determine_heuristic_problem_type(titanic_data, "Survived")
+
+        result = compute_confidence_score(
+            selected_target="Survived",
+            target_candidates=candidates,
+            df=titanic_data,
+            llm_problem_type="classification",
+            heuristic_problem_type=heuristic_type,
+        )
+
+        assert result["total_score"] == 100
+        assert len(result["breakdown"]) == 4
+
+        breakdown_dict = {b["check"]: b for b in result["breakdown"]}
+
+        # 1. target_name_match
+        assert breakdown_dict["target_name_match"]["points_awarded"] == 30
+        assert "Survived" in breakdown_dict["target_name_match"]["reason"]
+
+        # 2. cardinality_signal_strength
+        assert breakdown_dict["cardinality_signal_strength"]["points_awarded"] == 30
+        assert "Survived" in breakdown_dict["cardinality_signal_strength"]["reason"]
+
+        # 3. class_balance_reasonable
+        assert breakdown_dict["class_balance_reasonable"]["points_awarded"] == 20
+        assert "50.0%" in breakdown_dict["class_balance_reasonable"]["reason"]
+
+        # 4. llm_heuristic_agreement
+        assert breakdown_dict["llm_heuristic_agreement"]["points_awarded"] == 20
+        assert "agree" in breakdown_dict["llm_heuristic_agreement"]["reason"]
+
+    def test_partial_marks_unmatched_target_name(self, titanic_data):
+        """2. Partial-marks test: generic column name without keyword match scores 70/100."""
+        from agents.dataset_understanding import (
+            compute_confidence_score,
+            detect_target_candidates,
+            determine_heuristic_problem_type,
+        )
+
+        df = titanic_data.rename(columns={"Survived": "col_target_actual"})
+        candidates = detect_target_candidates(df, return_all=True)
+        heuristic_type = determine_heuristic_problem_type(df, "col_target_actual")
+
+        result = compute_confidence_score(
+            selected_target="col_target_actual",
+            target_candidates=candidates,
+            df=df,
+            llm_problem_type="classification",
+            heuristic_problem_type=heuristic_type,
+        )
+
+        assert result["total_score"] == 70
+        breakdown_dict = {b["check"]: b for b in result["breakdown"]}
+        assert breakdown_dict["target_name_match"]["points_awarded"] == 0
+        assert "No target naming" in breakdown_dict["target_name_match"]["reason"]
+        assert breakdown_dict["cardinality_signal_strength"]["points_awarded"] == 30
+        assert breakdown_dict["class_balance_reasonable"]["points_awarded"] == 20
+        assert breakdown_dict["llm_heuristic_agreement"]["points_awarded"] == 20
+
+    def test_class_imbalance(self, titanic_data):
+        """3. Class imbalance test: 95/5 distribution scores 0 on class_balance_reasonable."""
+        from agents.dataset_understanding import (
+            compute_confidence_score,
+            detect_target_candidates,
+            determine_heuristic_problem_type,
+        )
+
+        df = titanic_data.copy()
+        df["Survived"] = [1] * 95 + [0] * 5  # 95% class 1
+        candidates = detect_target_candidates(df, return_all=True)
+        heuristic_type = determine_heuristic_problem_type(df, "Survived")
+
+        result = compute_confidence_score(
+            selected_target="Survived",
+            target_candidates=candidates,
+            df=df,
+            llm_problem_type="classification",
+            heuristic_problem_type=heuristic_type,
+        )
+
+        assert result["total_score"] == 80
+        breakdown_dict = {b["check"]: b for b in result["breakdown"]}
+        assert breakdown_dict["class_balance_reasonable"]["points_awarded"] == 0
+        assert "95.0%" in breakdown_dict["class_balance_reasonable"]["reason"]
+
+    def test_llm_heuristic_disagreement(self, titanic_data):
+        """4. LLM-heuristic disagreement test: LLM=regression, heuristic=classification scores 0."""
+        from agents.dataset_understanding import (
+            compute_confidence_score,
+            detect_target_candidates,
+            determine_heuristic_problem_type,
+        )
+
+        candidates = detect_target_candidates(titanic_data, return_all=True)
+        heuristic_type = determine_heuristic_problem_type(titanic_data, "Survived")
+
+        result = compute_confidence_score(
+            selected_target="Survived",
+            target_candidates=candidates,
+            df=titanic_data,
+            llm_problem_type="regression",
+            heuristic_problem_type=heuristic_type,
+        )
+
+        assert result["total_score"] == 80
+        breakdown_dict = {b["check"]: b for b in result["breakdown"]}
+        assert breakdown_dict["llm_heuristic_agreement"]["points_awarded"] == 0
+        assert "disagree" in breakdown_dict["llm_heuristic_agreement"]["reason"]
+        assert "regression" in breakdown_dict["llm_heuristic_agreement"]["reason"]
+        assert "classification" in breakdown_dict["llm_heuristic_agreement"]["reason"]
+
+    def test_determinism(self, titanic_data):
+        """5. Determinism test: calling compute_confidence_score twice gives byte-for-byte identical output."""
+        from agents.dataset_understanding import (
+            compute_confidence_score,
+            detect_target_candidates,
+            determine_heuristic_problem_type,
+        )
+
+        candidates = detect_target_candidates(titanic_data, return_all=True)
+        heuristic_type = determine_heuristic_problem_type(titanic_data, "Survived")
+
+        res1 = compute_confidence_score("Survived", candidates, titanic_data, "classification", heuristic_type)
+        res2 = compute_confidence_score("Survived", candidates, titanic_data, "classification", heuristic_type)
+
+        assert res1 == res2
+        import json
+        assert json.dumps(res1, sort_keys=True) == json.dumps(res2, sort_keys=True)
+
+    def test_regression_target_student_performance(self):
+        """6. Regression target test: Student Performance Factors (Exam_Score).
+        Assert class balance awards +20 with 'N/A for regression' and regression signal check passes."""
+        from agents.dataset_understanding import (
+            compute_confidence_score,
+            detect_target_candidates,
+            determine_heuristic_problem_type,
+        )
+
+        n = 100
+        df = pd.DataFrame(
+            {
+                "Hours_Studied": [i % 24 for i in range(n)],
+                "Attendance": [50 + (i % 50) for i in range(n)],
+                "Exam_Score": [30.0 + (i % 70) for i in range(n)],
+            }
+        )
+
+        candidates = detect_target_candidates(df, return_all=True)
+        heuristic_type = determine_heuristic_problem_type(df, "Exam_Score")
+        assert heuristic_type == "regression"
+
+        result = compute_confidence_score(
+            selected_target="Exam_Score",
+            target_candidates=candidates,
+            df=df,
+            llm_problem_type="regression",
+            heuristic_problem_type=heuristic_type,
+        )
+
+        breakdown_dict = {b["check"]: b for b in result["breakdown"]}
+        assert breakdown_dict["class_balance_reasonable"]["points_awarded"] == 20
+        assert "N/A for regression" in breakdown_dict["class_balance_reasonable"]["reason"]
+        assert breakdown_dict["cardinality_signal_strength"]["points_awarded"] == 30
+        assert breakdown_dict["llm_heuristic_agreement"]["points_awarded"] == 20
+
+    def test_artifact_integration_includes_confidence_score(self, titanic_data, tmp_path):
+        """7. Artifact integration test: dataset_profile_v1.json includes confidence_score structure
+        without modifying existing profile fields."""
+        import json
+        from agents.pipeline_agents import DatasetUnderstandingAgent
+
+        artifacts_dir = str(tmp_path / "artifacts")
+        state = {
+            "df": titanic_data,
+            "artifacts_dir": artifacts_dir,
+        }
+
+        result_state = DatasetUnderstandingAgent().run(state)
+
+        assert "confidence_score" in result_state
+        cs = result_state["confidence_score"]
+        assert "total_score" in cs
+        assert "breakdown" in cs
+        assert len(cs["breakdown"]) == 4
+
+        artifact_file = result_state["dataset_profile_artifact_path"]
+        with open(artifact_file, "r") as f:
+            artifact_data = json.load(f)
+
+        assert "confidence_score" in artifact_data
+        assert "profile" in artifact_data
+        assert "target_candidates" in artifact_data
+        assert "selected_target" in artifact_data
+        assert "problem_type_analysis" in artifact_data
+

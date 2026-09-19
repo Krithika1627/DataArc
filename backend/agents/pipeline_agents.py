@@ -9,7 +9,9 @@ try:
     from agents.base_agent import BaseAgent
     from agents.dataset_understanding import (
         classify_problem_type,
+        compute_confidence_score,
         detect_target_candidates,
+        determine_heuristic_problem_type,
         profile_dataset,
     )
     from agents.data_cleaning import clean_dataset
@@ -21,7 +23,9 @@ except ImportError:
     from base_agent import BaseAgent
     from dataset_understanding import (
         classify_problem_type,
+        compute_confidence_score,
         detect_target_candidates,
+        determine_heuristic_problem_type,
         profile_dataset,
     )
     from data_cleaning import clean_dataset
@@ -39,6 +43,7 @@ class DatasetUnderstandingAgent(BaseAgent):
         profile = profile_dataset(df)
 
         target_candidates = detect_target_candidates(df)
+        all_candidates = detect_target_candidates(df, return_all=True)
 
         if state.get("user_selected_target"):
             selected_target = state["user_selected_target"]
@@ -52,12 +57,27 @@ class DatasetUnderstandingAgent(BaseAgent):
 
         if selected_target is not None:
             problem_type_analysis = classify_problem_type(profile, target_candidates)
+            heuristic_type = determine_heuristic_problem_type(df, selected_target)
+            confidence_score = compute_confidence_score(
+                selected_target=selected_target,
+                target_candidates=all_candidates,
+                df=df,
+                llm_problem_type=problem_type_analysis.get("problem_type", "unclear"),
+                heuristic_problem_type=heuristic_type,
+            )
         else:
             problem_type_analysis = {
                 "problem_type": "unclear",
                 "confidence_reasoning": "No target candidate was detected.",
                 "project_plan": "Cannot generate a project plan without a target.",
             }
+            confidence_score = compute_confidence_score(
+                selected_target="",
+                target_candidates=[],
+                df=df,
+                llm_problem_type="unclear",
+                heuristic_problem_type="unclear",
+            )
 
         saved_payload = {
             "profile": profile,
@@ -65,6 +85,7 @@ class DatasetUnderstandingAgent(BaseAgent):
             "selected_target": selected_target,
             "target_source": target_source,
             "problem_type_analysis": problem_type_analysis,
+            "confidence_score": confidence_score,
         }
         try:
             from agents.versioning_utils import save_artifact
@@ -80,6 +101,7 @@ class DatasetUnderstandingAgent(BaseAgent):
         state["selected_target"] = selected_target
         state["target_source"] = target_source
         state["problem_type_analysis"] = problem_type_analysis
+        state["confidence_score"] = confidence_score
         state["dataset_profile_artifact_path"] = artifact_path
 
         return state

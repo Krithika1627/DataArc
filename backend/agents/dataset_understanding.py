@@ -267,3 +267,150 @@ def classify_problem_type(profile: dict, target_candidates: list[dict]) -> dict:
         )
         return fallback
 
+
+def determine_heuristic_problem_type(df: pd.DataFrame, target_column: str | None) -> str:
+    """Determine problem type heuristically from dtype and cardinality of target column."""
+    if not target_column or target_column not in df.columns:
+        return "unclear"
+
+    series = df[target_column].dropna()
+    if len(series) == 0:
+        return "unclear"
+
+    unique_count = int(series.nunique())
+    is_numeric = pd.api.types.is_numeric_dtype(series)
+
+    if unique_count == 2:
+        return "classification"
+    if not is_numeric:
+        return "classification"
+    if unique_count <= 10:
+        return "classification"
+    if is_numeric and unique_count > 10:
+        return "regression"
+
+    return "classification"
+
+
+def compute_confidence_score(
+    selected_target: str,
+    target_candidates: list[dict],
+    df: pd.DataFrame,
+    llm_problem_type: str,
+    heuristic_problem_type: str,
+) -> dict:
+    """Compute a deterministic confidence score (0-100) and breakdown for selected target and problem type."""
+    cand = next(
+        (c for c in target_candidates if c.get("column_name") == selected_target),
+        None,
+    )
+    reasons = cand.get("reasons", []) if cand else []
+
+    # 1. target_name_match (+30/+0)
+    has_name_match = any(
+        "target naming pattern" in r.lower() or "domain-specific target pattern" in r.lower()
+        for r in reasons
+    )
+    if has_name_match:
+        p_name = 30
+        r_name = f"Column '{selected_target}' matched target name or domain keyword pattern"
+    else:
+        p_name = 0
+        r_name = f"No target naming pattern matched for '{selected_target}'"
+
+    # 2. cardinality_signal_strength (+30/+0)
+    is_regression = heuristic_problem_type.strip().lower() == "regression"
+    if is_regression:
+        has_reg_signal = any(
+            "strong regression target signal" in r.lower()
+            or ("regression" in r.lower() and "strong" in r.lower())
+            for r in reasons
+        )
+        if not has_reg_signal and selected_target in df.columns:
+            s = df[selected_target].dropna()
+            if pd.api.types.is_numeric_dtype(s) and s.nunique() > 10:
+                has_reg_signal = True
+
+        if has_reg_signal:
+            p_card = 30
+            r_card = f"Strong numeric high-cardinality signal for regression on '{selected_target}'"
+        else:
+            p_card = 0
+            r_card = f"Weak or absent regression signal on '{selected_target}'"
+    else:
+        has_cls_signal = any(
+            "boolean-like values" in r.lower()
+            or "suggests a classification target" in r.lower()
+            for r in reasons
+        )
+        if has_cls_signal:
+            p_card = 30
+            r_card = f"Strong cardinality signal for classification on '{selected_target}'"
+        else:
+            p_card = 0
+            r_card = f"Weak or absent cardinality signal for classification on '{selected_target}'"
+
+    # 3. class_balance_reasonable (+20/+0)
+    if is_regression:
+        p_bal = 20
+        r_bal = "N/A for regression - check not applicable"
+    else:
+        if not selected_target or selected_target not in df.columns:
+            p_bal = 0
+            r_bal = "Target column not found in dataframe"
+        elif len(df) < 10:
+            p_bal = 0
+            r_bal = f"Dataset row count ({len(df)} rows) is too small (<10 rows) to judge class balance meaningfully"
+        else:
+            vc = df[selected_target].dropna().value_counts(normalize=True)
+            if len(vc) == 0:
+                p_bal = 0
+                r_bal = "Target column has no non-null values"
+            else:
+                max_prop = float(vc.max())
+                if max_prop <= 0.90:
+                    p_bal = 20
+                    r_bal = f"Reasonable class balance (dominant class represents {round(max_prop * 100, 1)}% of rows <= 90%)"
+                else:
+                    p_bal = 0
+                    r_bal = f"Severe class imbalance: dominant class represents {round(max_prop * 100, 1)}% of rows (> 90%)"
+
+    # 4. llm_heuristic_agreement (+20/+0)
+    llm_clean = str(llm_problem_type).strip().lower()
+    heur_clean = str(heuristic_problem_type).strip().lower()
+    if llm_clean == heur_clean and llm_clean in ("classification", "regression"):
+        p_agree = 20
+        r_agree = f"LLM said {llm_clean}, heuristic said {heur_clean} - agree"
+    else:
+        p_agree = 0
+        r_agree = f"LLM said {llm_clean}, heuristic said {heur_clean} - disagree"
+
+    total_score = p_name + p_card + p_bal + p_agree
+
+    return {
+        "total_score": total_score,
+        "breakdown": [
+            {
+                "check": "target_name_match",
+                "points_awarded": p_name,
+                "reason": r_name,
+            },
+            {
+                "check": "cardinality_signal_strength",
+                "points_awarded": p_card,
+                "reason": r_card,
+            },
+            {
+                "check": "class_balance_reasonable",
+                "points_awarded": p_bal,
+                "reason": r_bal,
+            },
+            {
+                "check": "llm_heuristic_agreement",
+                "points_awarded": p_agree,
+                "reason": r_agree,
+            },
+        ],
+    }
+
+
