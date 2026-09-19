@@ -16,6 +16,7 @@ try:
     from agents.eda_agent import run_eda
     from agents.feature_engineering_agent import build_feature_pipeline
     from agents.ml_planning_agent import MLPlanningAgent
+    from agents.training_agent import TrainingAgent
 except ImportError:
     from base_agent import BaseAgent
     from dataset_understanding import (
@@ -27,6 +28,7 @@ except ImportError:
     from eda_agent import run_eda
     from feature_engineering_agent import build_feature_pipeline
     from ml_planning_agent import MLPlanningAgent
+    from training_agent import TrainingAgent
 
 
 class DatasetUnderstandingAgent(BaseAgent):
@@ -140,12 +142,39 @@ class FeatureEngineeringAgent(BaseAgent):
         ordinal_columns: dict[str, list[str]] | None = state.get("ordinal_columns")
         artifacts_dir: str = state.get("artifacts_dir", "artifacts")
 
+        high_missing_cols: list[str] = []
+        changelog_path = state.get("cleaning_changelog_path")
+        if changelog_path and os.path.exists(changelog_path):
+            try:
+                with open(changelog_path, "r") as f:
+                    cl = json.load(f)
+                flagged = cl.get("missing_value_imputation", {}).get(
+                    "columns_flagged_high_missing", []
+                )
+                for item in flagged:
+                    if isinstance(item, dict) and "column" in item:
+                        high_missing_cols.append(item["column"])
+                    elif isinstance(item, str):
+                        high_missing_cols.append(item)
+            except Exception:
+                pass
+
         fe_result = build_feature_pipeline(
             cleaned_df,
             target_column=target_column,
             problem_type=problem_type,
             ordinal_columns=ordinal_columns,
+            high_missing_columns=high_missing_cols,
         )
+
+        transformed_df = fe_result["transformed_df"]
+        if transformed_df.isna().any().any():
+            null_counts = transformed_df.isna().sum()
+            nan_cols = null_counts[null_counts > 0].to_dict()
+            raise ValueError(
+                f"Validation failed: transformed_df contains NaN values in columns: {nan_cols}. "
+                f"Feature matrix must be strictly NaN-free."
+            )
 
         try:
             from agents.versioning_utils import get_next_version, save_artifact
@@ -154,7 +183,7 @@ class FeatureEngineeringAgent(BaseAgent):
 
         version = get_next_version(artifacts_dir, "feature_engineered")
         csv_path = save_artifact(
-            fe_result["transformed_df"],
+            transformed_df,
             artifacts_dir,
             "feature_engineered",
             "csv",

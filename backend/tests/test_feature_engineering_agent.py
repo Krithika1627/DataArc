@@ -118,8 +118,13 @@ class TestBuildFeaturePipeline:
         label_transformer = next(
             t for name, t, _ in ct.transformers_ if name == "label"
         )
-        assert isinstance(label_transformer, OrdinalEncoder)
-        assert not isinstance(label_transformer, LabelEncoder)
+        encoder = (
+            label_transformer.named_steps["label"]
+            if hasattr(label_transformer, "named_steps")
+            else label_transformer
+        )
+        assert isinstance(encoder, OrdinalEncoder)
+        assert not isinstance(encoder, LabelEncoder)
 
     def test_transform_held_out_unseen_category_no_raise(self, feature_df):
         """handle_unknown='use_encoded_value' must actually be wired in: a
@@ -390,3 +395,108 @@ class TestBuildFeaturePipelineCrossDataset:
         assert "scaled__Hours_Studied" in tdf.columns
         assert "scaled__Attendance" in tdf.columns
         assert tdf["scaled__Hours_Studied"].mean() == pytest.approx(0.0, abs=1e-6)
+
+
+class TestNanLeakageFixAndGuardrails:
+    """Tests for NaN-leakage prevention, SimpleImputer integration, and save-time validation."""
+
+    @pytest.fixture
+    def titanic_with_cabin(self) -> pd.DataFrame:
+        """Titanic dataset with high-missing Cabin and moderate-missing Age."""
+        n = 100
+        return pd.DataFrame(
+            {
+                "PassengerId": range(1, n + 1),
+                "Name": [f"Passenger_{i}" for i in range(n)],
+                "Age": [22.0 + (i % 40) if i % 5 != 0 else np.nan for i in range(n)],
+                "Fare": [7.25 + (i % 50) for i in range(n)],
+                "Sex": ["male", "female"] * (n // 2),
+                "Cabin": [f"C{i}" if i < 20 else np.nan for i in range(n)],  # 80% missing
+                "Embarked": (["S", "C", "Q"] * (n // 3 + 1))[:n],
+                "Survived": [0, 1] * (n // 2),
+            }
+        )
+
+    def test_titanic_has_zero_nans_and_excludes_cabin(self, titanic_with_cabin):
+        """1. Regression test: Cabin (80% missing) is excluded and output is strictly NaN-free."""
+        result = build_feature_pipeline(
+            titanic_with_cabin,
+            target_column="Survived",
+            problem_type="classification",
+        )
+        tdf = result["transformed_df"]
+        em = result["encoding_map"]
+
+        # Assert Cabin is excluded
+        assert "Cabin" in result["excluded_columns"]
+        assert em["Cabin"] == "excluded"
+        assert not any("Cabin" in col for col in tdf.columns)
+
+        # Assert ZERO NaNs across all columns
+        assert tdf.isna().sum().sum() == 0
+
+    def test_imputer_handles_residual_nans_across_all_column_types(self):
+        """2. SimpleImputer guarantees NaN-free matrix for numeric, categorical, and ordinal paths."""
+        df = pd.DataFrame(
+            {
+                "num_feat": [10.0, 20.0, np.nan, 40.0, 50.0],
+                "cat_low": ["A", "B", np.nan, "A", "B"],
+                "cat_high": [f"code_{i}" if i != 2 else np.nan for i in range(5)],
+                "ord_feat": ["low", "high", np.nan, "medium", "high"],
+                "target": [1, 0, 1, 0, 1],
+            }
+        )
+        result = build_feature_pipeline(
+            df,
+            target_column="target",
+            problem_type="classification",
+            ordinal_columns={"ord_feat": ["low", "medium", "high"]},
+            cardinality_threshold=3,
+        )
+        tdf = result["transformed_df"]
+        assert tdf.isna().sum().sum() == 0
+        assert len(tdf) == 5
+
+    def test_save_time_guardrail_raises_on_nans(self, monkeypatch):
+        """3. Save-time validation guardrail raises clear error if NaNs exist in output."""
+        import sklearn.pipeline
+        n = 10
+        df = pd.DataFrame({"feat": [1.0, 2.0] * 5, "target": [0, 1] * 5})
+        orig_fit_transform = sklearn.pipeline.Pipeline.fit_transform
+
+        def bad_fit_transform(self, X, y=None, **kwargs):
+            orig_fit_transform(self, X, y, **kwargs)
+            arr = np.ones((n, 1))
+            arr[2, 0] = np.nan
+            return arr
+
+        monkeypatch.setattr(sklearn.pipeline.Pipeline, "fit_transform", bad_fit_transform)
+        with pytest.raises(ValueError, match="Validation failed: transformed_df contains NaN values"):
+            build_feature_pipeline(df, target_column="target", problem_type="classification")
+
+    def test_student_performance_dataset_zero_nans(self):
+        """4. Verify zero-NaN guarantee holds across student dataset with injected missingness."""
+        rng = np.random.default_rng(11)
+        n = 100
+        df = pd.DataFrame(
+            {
+                "Hours_Studied": [float(i % 24) for i in range(n)],
+                "Attendance": [float(i % 100) for i in range(n)],
+                "Gender": rng.choice(["Male", "Female"], n),
+                "grade": rng.choice(["F", "D", "C", "B", "A"], n),
+                "Exam_Score": [30.0 + (i % 70) for i in range(n)],
+            }
+        )
+        df.loc[0:10, "Hours_Studied"] = np.nan
+        df.loc[5:15, "Gender"] = np.nan
+        df.loc[10:20, "grade"] = np.nan
+
+        result = build_feature_pipeline(
+            df,
+            target_column="Exam_Score",
+            problem_type="regression",
+            ordinal_columns={"grade": ["F", "D", "C", "B", "A"]},
+        )
+        tdf = result["transformed_df"]
+        assert tdf.isna().sum().sum() == 0
+

@@ -25,6 +25,23 @@ except ImportError:
     )
 
 
+SUPPORTED_MODELS: dict[str, list[str]] = {
+    "classification": [
+        "Logistic Regression",
+        "Random Forest Classifier",
+        "XGBoost Classifier",
+        "LightGBM Classifier",
+        "SVC",
+    ],
+    "regression": [
+        "Linear Regression",
+        "Random Forest Regressor",
+        "XGBoost Regressor",
+        "LightGBM Regressor",
+    ],
+}
+
+
 class CandidateModel(TypedDict):
     model_name: str
     reasoning: str
@@ -174,6 +191,7 @@ def extract_ml_planning_summary(state: dict) -> dict[str, Any]:
 
 
 def _build_ml_planning_prompt(summary: dict) -> str:
+    guess = summary.get("earlier_problem_type_guess", "unclear")
     lines = [
         "You are an expert Machine Learning Engineer creating a dataset-specific ML training plan.",
         "Based on the dataset summary below, confirm the problem type, choose the single best evaluation metric, and recommend 4 to 6 candidate models.",
@@ -182,7 +200,7 @@ def _build_ml_planning_prompt(summary: dict) -> str:
         f"- Total rows: {summary.get('row_count', 'unknown')}",
         f"- Total columns: {summary.get('column_count', 'unknown')}",
         f"- Target column: {summary.get('target_column', 'unknown')}",
-        f"- Earlier problem type guess (Week 1): {summary.get('earlier_problem_type_guess', 'unclear')}",
+        f"- Earlier problem type guess (Week 1): {guess}",
     ]
     if summary.get("earlier_confidence_reasoning"):
         lines.append(f"  (Earlier reasoning: {summary['earlier_confidence_reasoning']})")
@@ -212,11 +230,15 @@ def _build_ml_planning_prompt(summary: dict) -> str:
 
     lines.extend([
         "",
+        "SUPPORTED CANDIDATE MODELS (HARD CONSTRAINT):",
+        f"- Classification models: {', '.join(SUPPORTED_MODELS['classification'])}",
+        f"- Regression models: {', '.join(SUPPORTED_MODELS['regression'])}",
+        "",
         "INSTRUCTIONS:",
         "1. Confirm problem_type as either 'classification' or 'regression'. Cross-check against the earlier guess rather than blindly trusting either source.",
         "2. Provide 1-2 sentences of confirmation_reasoning explaining why this problem type is appropriate.",
         "3. Recommend ONE primary evaluation metric best suited to this specific dataset (e.g. F1, ROC-AUC, Balanced Accuracy for imbalanced classification; Accuracy for balanced; RMSE, MAE, R2 for regression) with 1-2 sentences of metric_reasoning.",
-        "4. Recommend 4 to 6 candidate models appropriate for the confirmed problem type (e.g. Logistic Regression, Random Forest Classifier, XGBoost Classifier, LightGBM Classifier, Gradient Boosting Classifier for classification; Linear Regression, Ridge, Random Forest Regressor, XGBoost Regressor, LightGBM Regressor for regression), each with a one-line reasoning explaining why it fits this dataset.",
+        "4. Recommend 4 to 6 candidate models chosen ONLY from the supported models list for your confirmed problem_type. Do NOT invent, recommend, or suggest any model names outside this list, even if another model might fit. Each model must have a one-line reasoning explaining why it fits this dataset.",
         "",
         "STRICT JSON OUTPUT ONLY. Respond with a valid JSON object matching this schema exactly:",
         "{",
@@ -271,7 +293,8 @@ def parse_and_validate_ml_plan(raw_text: str) -> dict:
         raise ValueError(
             f"Invalid problem_type '{problem_type}'. Must be 'classification' or 'regression'."
         )
-    data["problem_type"] = problem_type.strip().lower()
+    problem_type = problem_type.strip().lower()
+    data["problem_type"] = problem_type
 
     if (
         not isinstance(data.get("confirmation_reasoning"), str)
@@ -295,6 +318,9 @@ def parse_and_validate_ml_plan(raw_text: str) -> dict:
     if not isinstance(candidate_models, list) or len(candidate_models) == 0:
         raise ValueError("candidate_models must be a non-empty list.")
 
+    supported = SUPPORTED_MODELS.get(problem_type, [])
+    valid_candidate_models: list[dict[str, str]] = []
+
     for i, model in enumerate(candidate_models):
         if not isinstance(model, dict):
             raise ValueError(f"Candidate model at index {i} must be an object.")
@@ -315,6 +341,35 @@ def parse_and_validate_ml_plan(raw_text: str) -> dict:
                 f"Candidate model at index {i} missing valid non-empty 'reasoning'."
             )
 
+        model_name = model["model_name"].strip()
+        if model_name in supported:
+            valid_candidate_models.append(
+                {"model_name": model_name, "reasoning": model["reasoning"].strip()}
+            )
+        else:
+            error_msg = (
+                f"Constraint violation: LLM recommended unsupported model '{model_name}' "
+                f"for problem_type '{problem_type}'. Filtering out."
+            )
+            log_agent_run(
+                agent_name="ml_planning_constraint_violation",
+                inputs_summary={
+                    "model_name": model_name,
+                    "problem_type": problem_type,
+                    "supported_models": supported,
+                },
+                outputs_summary={"status": "filtered_out"},
+                duration_seconds=0.0,
+                error=error_msg,
+            )
+
+    if len(valid_candidate_models) < 2:
+        raise ValueError(
+            f"Fewer than 2 valid candidate models remaining after filtering unsupported models "
+            f"(found {len(valid_candidate_models)}). Supported models for '{problem_type}' are: {supported}."
+        )
+
+    data["candidate_models"] = valid_candidate_models
     return data
 
 
@@ -371,6 +426,13 @@ class MLPlanningAgent(BaseAgent):
         try:
             plan = generate_ml_plan(summary)
             duration = time.perf_counter() - start_time
+
+            artifacts_dir = state.get("artifacts_dir", "artifacts")
+            artifact_path = save_artifact(
+                plan, artifacts_dir, "ml_plan", "json"
+            )
+            state["ml_plan_artifact_path"] = artifact_path
+
             log_agent_run(
                 agent_name="ml_planning",
                 inputs_summary=inputs_summary,

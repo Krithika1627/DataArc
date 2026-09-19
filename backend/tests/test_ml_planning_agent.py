@@ -9,6 +9,8 @@ from fastapi.testclient import TestClient
 
 from agents.ml_planning_agent import (
     MLPlanningAgent,
+    SUPPORTED_MODELS,
+    _build_ml_planning_prompt,
     extract_ml_planning_summary,
     parse_and_validate_ml_plan,
 )
@@ -36,9 +38,9 @@ VALID_REGRESSION_PLAN_JSON = json.dumps({
     "metric_reasoning": "RMSE penalizes larger prediction errors and maintains original units.",
     "candidate_models": [
         {"model_name": "Linear Regression", "reasoning": "Simple interpretable baseline."},
-        {"model_name": "Ridge Regression", "reasoning": "Linear model with L2 regularization against multicollinearity."},
         {"model_name": "Random Forest Regressor", "reasoning": "Captures non-linear dynamics without overfitting."},
         {"model_name": "XGBoost Regressor", "reasoning": "High performance on complex non-linear feature interactions."},
+        {"model_name": "LightGBM Regressor", "reasoning": "Fast gradient boosting for regression."},
     ],
 })
 
@@ -187,10 +189,96 @@ class TestMLPlanningAgent:
         missing_key = json.dumps({
             "problem_type": "classification",
             "recommended_metric": "Accuracy",
-            "candidate_models": [{"model_name": "LR", "reasoning": "fit"}],
+            "candidate_models": [{"model_name": "Logistic Regression", "reasoning": "fit"}],
         })
         with pytest.raises(ValueError, match="ML plan missing required keys"):
             parse_and_validate_ml_plan(missing_key)
+
+    def test_prompt_construction_injects_supported_models(self):
+        """Prompt construction test: assert SUPPORTED_MODELS are injected into prompt."""
+        summary = {
+            "row_count": 100,
+            "column_count": 5,
+            "target_column": "Survived",
+            "earlier_problem_type_guess": "classification",
+        }
+        prompt = _build_ml_planning_prompt(summary)
+
+        for model in SUPPORTED_MODELS["classification"]:
+            assert model in prompt
+        for model in SUPPORTED_MODELS["regression"]:
+            assert model in prompt
+        assert "HARD CONSTRAINT" in prompt
+
+    def test_constraint_violation_filters_unsupported_models_and_logs(
+        self, sample_state, monkeypatch, mock_gemini_client
+    ):
+        """Constraint violation test: mock LLM to return unsupported model name mixed with valid ones.
+        Assert unsupported name is filtered out, violation logged distinctly, and only valid names remain.
+        """
+        monkeypatch.setenv("GEMINI_API_KEY", "test-api-key")
+
+        llm_response_with_unsupported = json.dumps({
+            "problem_type": "classification",
+            "confirmation_reasoning": "Binary survival target.",
+            "recommended_metric": "F1-Score",
+            "metric_reasoning": "Balanced evaluation.",
+            "candidate_models": [
+                {"model_name": "Logistic Regression", "reasoning": "Valid linear model."},
+                {"model_name": "CatBoost Classifier", "reasoning": "Unsupported model library."},
+                {"model_name": "Random Forest Classifier", "reasoning": "Valid ensemble."},
+                {"model_name": "XGBoost Classifier", "reasoning": "Valid boosting."},
+            ],
+        })
+
+        mock_client = mock_gemini_client(llm_response_with_unsupported)
+
+        logged_violations = []
+        def mock_log(agent_name, inputs_summary, outputs_summary, duration_seconds, error=None):
+            if agent_name == "ml_planning_constraint_violation":
+                logged_violations.append({
+                    "inputs": inputs_summary,
+                    "error": error,
+                })
+
+        monkeypatch.setattr("agents.ml_planning_agent.log_agent_run", mock_log)
+
+        with unittest.mock.patch("google.genai.Client", return_value=mock_client):
+            agent = MLPlanningAgent()
+            result_state = agent.run(sample_state)
+
+        plan = result_state["ml_plan"]
+        remaining_models = [m["model_name"] for m in plan["candidate_models"]]
+
+        # Invalid entry filtered out
+        assert "CatBoost Classifier" not in remaining_models
+        assert remaining_models == [
+            "Logistic Regression",
+            "Random Forest Classifier",
+            "XGBoost Classifier",
+        ]
+
+        # Distinct constraint violation log captured
+        assert len(logged_violations) == 1
+        assert logged_violations[0]["inputs"]["model_name"] == "CatBoost Classifier"
+        assert "Constraint violation" in logged_violations[0]["error"]
+
+    def test_total_violation_edge_case_raises_clear_error(self):
+        """Total violation test: mock LLM with all unsupported models; assert clear error raised."""
+        all_unsupported = json.dumps({
+            "problem_type": "classification",
+            "confirmation_reasoning": "Binary target.",
+            "recommended_metric": "Accuracy",
+            "metric_reasoning": "Balanced accuracy.",
+            "candidate_models": [
+                {"model_name": "CatBoost Classifier", "reasoning": "Unsupported."},
+                {"model_name": "K-Nearest Neighbors", "reasoning": "Unsupported."},
+                {"model_name": "Naive Bayes", "reasoning": "Unsupported."},
+            ],
+        })
+
+        with pytest.raises(ValueError, match="Fewer than 2 valid candidate models remaining"):
+            parse_and_validate_ml_plan(all_unsupported)
 
     def test_malformed_json_handling_and_logging(self, sample_state, monkeypatch, mock_gemini_client):
         """3. Malformed-JSON handling test - mock the LLM to return invalid/non-JSON text,
@@ -240,9 +328,9 @@ class TestMLPlanningAgent:
             agent = MLPlanningAgent()
             result_state = agent.run(sample_state)
 
-        # Assert only ml_plan was added
+        # Assert ml_plan and ml_plan_artifact_path were added
         new_keys = set(result_state.keys())
-        assert new_keys - original_keys == {"ml_plan"}
+        assert new_keys - original_keys == {"ml_plan", "ml_plan_artifact_path"}
 
         # Assert all previous keys and their exact references/values are unchanged
         for k in original_keys:

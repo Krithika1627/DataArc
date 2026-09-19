@@ -19,6 +19,7 @@ from agents.data_cleaning import clean_dataset
 from agents.eda_agent import run_eda
 from agents.feature_engineering_agent import build_feature_pipeline
 from agents.ml_planning_agent import MLPlanningAgent
+from agents.training_agent import TrainingAgent
 from agents.logging_utils import log_agent_run
 from agents.versioning_utils import get_next_version, save_artifact, get_latest_version_path
 
@@ -767,6 +768,9 @@ class MLPlanResponse(BaseModel):
     candidate_models: list[CandidateModelResponse] = Field(
         description="4-6 candidate models with reasoning"
     )
+    artifact_path: Optional[str] = Field(
+        default=None, description="Path to the saved ml_plan_v{N}.json artifact"
+    )
 
 
 class PlanTrainingRequest(BaseModel):
@@ -793,7 +797,7 @@ class PlanTrainingRequest(BaseModel):
 @app.post("/plan-training", response_model=MLPlanResponse)
 @app.post("/plan-ml", response_model=MLPlanResponse)
 async def plan_training_endpoint(
-    request: dict[str, Any] = Body(...),
+    request: dict[str, Any] = Body(default_factory=dict),
 ):
     try:
         if "state" in request and isinstance(request["state"], dict):
@@ -815,10 +819,64 @@ async def plan_training_endpoint(
             candidate_models=[
                 CandidateModelResponse(**m) for m in plan["candidate_models"]
             ],
+            artifact_path=result_state.get("ml_plan_artifact_path"),
         )
     except Exception as exc:
         raise HTTPException(
             status_code=400,
             detail=str(exc),
         )
+
+
+class ModelTrainingResultResponse(BaseModel):
+    model_name: str = Field(description="Name of the candidate model")
+    status: str = Field(description="One of 'success', 'failed', 'skipped_unrecognized'")
+    recommended_metric: str = Field(description="Name of the recommended metric")
+    score: Optional[float] = Field(default=None, description="Primary score for recommended metric")
+    metrics: Optional[dict[str, float]] = Field(default=None, description="Computed metrics dictionary")
+    training_time_seconds: float = Field(description="Training duration in seconds")
+    error_message: Optional[str] = Field(default=None, description="Error message if model failed or was skipped")
+
+
+class TrainingSummaryResponse(BaseModel):
+    total_models: int = Field(description="Total candidate models processed")
+    succeeded: int = Field(description="Number of models trained successfully")
+    failed: int = Field(description="Number of models that failed during fit/evaluation")
+    skipped_unrecognized: int = Field(description="Number of models skipped as unrecognized")
+
+
+class TrainModelsResponse(BaseModel):
+    comparison_table: list[ModelTrainingResultResponse] = Field(description="Ranked list of model training results")
+    artifact_path: str = Field(description="Path to saved training results JSON artifact")
+    summary: TrainingSummaryResponse = Field(description="Overall training run summary")
+
+
+@app.post("/train-models", response_model=TrainModelsResponse)
+@app.post("/train", response_model=TrainModelsResponse)
+async def train_models_endpoint(
+    request: dict[str, Any] = Body(default_factory=dict),
+):
+    try:
+        if "state" in request and isinstance(request["state"], dict):
+            state_dict = dict(request["state"])
+        else:
+            state_dict = dict(request)
+
+        agent = TrainingAgent()
+        result_state = agent.run(state_dict)
+        results = result_state.get("training_results", [])
+        artifact_path = result_state.get("training_results_artifact_path", "")
+        summary = result_state.get("training_summary", {})
+
+        return TrainModelsResponse(
+            comparison_table=[ModelTrainingResultResponse(**r) for r in results],
+            artifact_path=artifact_path,
+            summary=TrainingSummaryResponse(**summary),
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+
 
