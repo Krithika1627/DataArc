@@ -58,7 +58,7 @@ def mock_gemini_client():
 
 
 @pytest.fixture
-def sample_state() -> dict:
+def sample_state(tmp_path) -> dict:
     """Realistic pipeline state from Weeks 1-4."""
     n = 100
     df = pd.DataFrame({
@@ -71,6 +71,7 @@ def sample_state() -> dict:
     return {
         "df": df,
         "cleaned_df": df.copy(),
+        "artifacts_dir": str(tmp_path / "artifacts"),
         "selected_target": "Survived",
         "profile": {
             "row_count": n,
@@ -363,6 +364,7 @@ class TestMLPlanningAgent:
 
         # Prepare JSON-serializable state
         serializable_state = {
+            "artifacts_dir": sample_state["artifacts_dir"],
             "selected_target": sample_state["selected_target"],
             "profile": sample_state["profile"],
             "problem_type_analysis": sample_state["problem_type_analysis"],

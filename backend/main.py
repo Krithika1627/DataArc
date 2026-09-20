@@ -22,6 +22,7 @@ from agents.eda_agent import run_eda
 from agents.feature_engineering_agent import build_feature_pipeline
 from agents.ml_planning_agent import MLPlanningAgent
 from agents.training_agent import TrainingAgent
+from agents.evaluation_agent import EvaluationAgent
 from agents.logging_utils import log_agent_run
 from agents.versioning_utils import get_next_version, save_artifact, get_latest_version_path
 
@@ -890,7 +891,7 @@ class TrainModelsResponse(BaseModel):
     summary: TrainingSummaryResponse = Field(description="Overall training run summary")
 
 
-@app.post("/train", response_model=TrainModelsResponse)
+@app.post("/train-models", response_model=TrainModelsResponse)
 async def train_models_endpoint(
     request: dict[str, Any] = Body(default_factory=dict),
 ):
@@ -916,5 +917,51 @@ async def train_models_endpoint(
             status_code=400,
             detail=str(exc),
         )
+
+
+class SkippedVisualizationItem(BaseModel):
+    type: str = Field(description="Name/type of visualization skipped")
+    reason: str = Field(description="Reason for skipping the visualization")
+
+
+class EvaluationResponse(BaseModel):
+    winning_model_name: str = Field(description="Name of the winning model")
+    problem_type: str = Field(description="Problem type (classification or regression)")
+    recommended_metric: str = Field(description="Metric used for evaluation")
+    winning_score: float = Field(description="Primary metric score achieved by the winning model")
+    runner_up_model_name: Optional[str] = Field(default=None, description="Name of the runner-up model if available")
+    runner_up_score: Optional[float] = Field(default=None, description="Score of the runner-up model if available")
+    score_gap: Optional[float] = Field(default=None, description="Absolute difference between winner and runner-up scores")
+    confusion_matrix: Optional[str] = Field(default=None, description="Plotly JSON string of confusion matrix")
+    roc_curve: Optional[str] = Field(default=None, description="Plotly JSON string of ROC curve")
+    feature_importance_chart: Optional[str] = Field(default=None, description="Plotly JSON string of feature importances")
+    llm_explanation: str = Field(description="LLM-generated explanation of the evaluation results")
+    skipped_visualizations: list[SkippedVisualizationItem] = Field(default_factory=list, description="List of skipped visualizations with reasons")
+    artifact_path: str = Field(description="Path to saved evaluation bundle JSON artifact")
+
+
+@app.post("/evaluate-model", response_model=EvaluationResponse)
+async def evaluate_model_endpoint(
+    request: dict[str, Any] = Body(default_factory=dict),
+):
+    try:
+        if "state" in request and isinstance(request["state"], dict):
+            state_dict = dict(request["state"])
+        else:
+            state_dict = dict(request)
+
+        agent = EvaluationAgent()
+        result_state = agent.run(state_dict)
+        bundle = result_state.get("evaluation_bundle")
+        if not bundle:
+            raise ValueError("EvaluationAgent did not produce an 'evaluation_bundle' in state.")
+
+        return EvaluationResponse(**bundle)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+
 
 
