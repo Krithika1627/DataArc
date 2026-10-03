@@ -9,6 +9,7 @@ from typing import Any, Optional
 
 import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Body
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from agents.dataset_understanding import (
     classify_problem_type,
@@ -23,6 +24,7 @@ from agents.feature_engineering_agent import build_feature_pipeline
 from agents.ml_planning_agent import MLPlanningAgent
 from agents.training_agent import TrainingAgent
 from agents.evaluation_agent import EvaluationAgent
+from agents.report_agent import ReportAgent
 from agents.logging_utils import log_agent_run
 from agents.versioning_utils import get_next_version, save_artifact, get_latest_version_path
 
@@ -962,6 +964,37 @@ async def evaluate_model_endpoint(
             status_code=400,
             detail=str(exc),
         )
+
+
+@app.post("/generate-report")
+async def generate_report_endpoint(
+    request: dict[str, Any] = Body(default_factory=dict),
+):
+    try:
+        if "state" in request and isinstance(request["state"], dict):
+            state_dict = dict(request["state"])
+        else:
+            state_dict = dict(request)
+
+        agent = ReportAgent()
+        result_state = agent.run(state_dict)
+        report_path = result_state.get("report_pdf_path")
+        if not report_path or not os.path.exists(report_path):
+            raise ValueError("ReportAgent did not produce a valid PDF report.")
+
+        filename = os.path.basename(report_path)
+        return FileResponse(
+            path=report_path,
+            media_type="application/pdf",
+            filename=filename,
+            headers={"Content-Disposition": f"inline; filename={filename}"},
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+
 
 
 

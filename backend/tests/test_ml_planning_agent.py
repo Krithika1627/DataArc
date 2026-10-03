@@ -358,7 +358,7 @@ class TestMLPlanningAgent:
         assert summary["encoding_map"]["Sex"] == "onehot"
 
     def test_fastapi_plan_training_endpoint(self, sample_state, monkeypatch, mock_gemini_client):
-        """8. FastAPI endpoint test for /plan-training and /plan-ml."""
+        """8. FastAPI endpoint test for /plan-ml."""
         monkeypatch.setenv("GEMINI_API_KEY", "test-api-key")
         mock_client = mock_gemini_client(VALID_CLASSIFICATION_PLAN_JSON)
 
@@ -373,14 +373,14 @@ class TestMLPlanningAgent:
         }
 
         with unittest.mock.patch("google.genai.Client", return_value=mock_client):
-            response = client.post("/plan-training", json=serializable_state)
+            response = client.post("/plan-ml", json=serializable_state)
             assert response.status_code == 200
             data = response.json()
             assert data["problem_type"] == "classification"
             assert data["recommended_metric"] == "F1-Score"
             assert len(data["candidate_models"]) == 4
 
-            # Test alias endpoint /plan-ml
-            response_alias = client.post("/plan-ml", json={"state": serializable_state})
-            assert response_alias.status_code == 200
-            assert response_alias.json()["problem_type"] == "classification"
+            # Also test when wrapped inside a state dict
+            response_wrapped = client.post("/plan-ml", json={"state": serializable_state})
+            assert response_wrapped.status_code == 200
+            assert response_wrapped.json()["problem_type"] == "classification"
