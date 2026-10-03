@@ -8,6 +8,19 @@ from typing import Any
 import pandas as pd
 
 
+def get_dataset_artifacts_dir(base_dir: str, dataset_id: str) -> str:
+    """
+    Returns base_dir/dataset_id, creating the directory if it doesn't
+    exist. This is the folder every agent should read/write to for a
+    given dataset's pipeline run.
+    """
+    if not dataset_id or not str(dataset_id).strip():
+        raise ValueError("dataset_id cannot be empty or None.")
+    path = os.path.join(base_dir, str(dataset_id).strip())
+    os.makedirs(path, exist_ok=True)
+    return os.path.abspath(path)
+
+
 def get_next_version(artifacts_dir: str, base_filename: str) -> int:
     if not os.path.exists(artifacts_dir):
         return 1

@@ -37,8 +37,8 @@ def remove_duplicates(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
 def save_versioned_artifact(
     df: pd.DataFrame,
     stage_name: str,
+    artifacts_dir: str,
     version: int | None = None,
-    artifacts_dir: str = "artifacts",
 ) -> str:
     """Save a DataFrame as a versioned CSV file inside the artifacts directory"""
     try:
@@ -520,10 +520,13 @@ def fix_dtypes(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
 @with_agent_logging("data_cleaning_orchestration")
 def clean_dataset(
     df: pd.DataFrame,
-    artifacts_dir: str = "artifacts",
+    artifacts_dir: str,
     target_column: str | None = None,
     cap_target: bool = False,
 ) -> dict:
+    if not artifacts_dir or not str(artifacts_dir).strip():
+        raise ValueError("artifacts_dir must be provided and non-empty.")
+
     deduped_df, dup_summary = remove_duplicates(df)
 
     dtyped_df, dtype_summary = fix_dtypes(deduped_df)
@@ -553,7 +556,7 @@ def clean_dataset(
     version = get_next_version(artifacts_dir, "cleaned")
 
     artifact_path = save_versioned_artifact(
-        cleaned_df, "cleaned", version=version, artifacts_dir=artifacts_dir,
+        cleaned_df, "cleaned", artifacts_dir=artifacts_dir, version=version,
     )
 
     os.makedirs(artifacts_dir, exist_ok=True)

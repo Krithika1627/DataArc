@@ -117,7 +117,9 @@ def _build_planning_summary(
     }
 
 
-def load_planning_inputs(artifacts_dir: str = "artifacts") -> dict[str, Any]:
+def load_planning_inputs(artifacts_dir: str) -> dict[str, Any]:
+    if not artifacts_dir or not str(artifacts_dir).strip():
+        raise ValueError("artifacts_dir must be provided and non-empty.")
     profile_path = get_latest_version_path(artifacts_dir, "dataset_profile", "json")
     cleaning_path = get_latest_version_path(artifacts_dir, "cleaned", "json")  # the changelog
     eda_path = get_latest_version_path(artifacts_dir, "eda_bundle", "json")
@@ -137,11 +139,18 @@ def load_planning_inputs(artifacts_dir: str = "artifacts") -> dict[str, Any]:
 
 def extract_ml_planning_summary(state: dict) -> dict[str, Any]:
     if not state.get("profile") and not state.get("selected_target") and not state.get("df"):
-        artifacts_dir = state.get("artifacts_dir", "artifacts")
-        try:
-            return load_planning_inputs(artifacts_dir)
-        except FileNotFoundError:
-            pass
+        artifacts_dir = state.get("artifacts_dir")
+        if not artifacts_dir and state.get("dataset_id"):
+            try:
+                from agents.versioning_utils import get_dataset_artifacts_dir
+            except ImportError:
+                from versioning_utils import get_dataset_artifacts_dir
+            artifacts_dir = get_dataset_artifacts_dir("artifacts", state["dataset_id"])
+        if artifacts_dir:
+            try:
+                return load_planning_inputs(artifacts_dir)
+            except FileNotFoundError:
+                pass
 
     target_column = state.get("selected_target") or state.get("target_column")
 
@@ -423,11 +432,23 @@ class MLPlanningAgent(BaseAgent):
             "column_count": summary.get("column_count"),
         }
 
+        artifacts_dir = state.get("artifacts_dir")
+        if not artifacts_dir:
+            dataset_id = state.get("dataset_id")
+            if dataset_id:
+                try:
+                    from agents.versioning_utils import get_dataset_artifacts_dir
+                except ImportError:
+                    from versioning_utils import get_dataset_artifacts_dir
+                artifacts_dir = get_dataset_artifacts_dir("artifacts", dataset_id)
+            else:
+                raise ValueError("artifacts_dir or dataset_id must be provided in state.")
+        state["artifacts_dir"] = artifacts_dir
+
         try:
             plan = generate_ml_plan(summary)
             duration = time.perf_counter() - start_time
 
-            artifacts_dir = state.get("artifacts_dir", "artifacts")
             artifact_path = save_artifact(
                 plan, artifacts_dir, "ml_plan", "json"
             )

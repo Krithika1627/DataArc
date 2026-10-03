@@ -26,7 +26,47 @@ from agents.training_agent import TrainingAgent
 from agents.evaluation_agent import EvaluationAgent
 from agents.report_agent import ReportAgent
 from agents.logging_utils import log_agent_run
-from agents.versioning_utils import get_next_version, save_artifact, get_latest_version_path
+from agents.versioning_utils import (
+    get_dataset_artifacts_dir,
+    get_latest_version_path,
+    get_next_version,
+    save_artifact,
+)
+import uuid
+
+BASE_ARTIFACTS_DIR = os.getenv("DATAARC_ARTIFACTS_DIR", "artifacts")
+
+
+def resolve_dataset_artifacts_dir(
+    dataset_id: Optional[str] = None,
+    create_if_missing: bool = False,
+    explicit_artifacts_dir: Optional[str] = None,
+) -> tuple[str, str]:
+    if explicit_artifacts_dir:
+        clean_id = str(dataset_id).strip() if dataset_id else os.path.basename(explicit_artifacts_dir)
+        os.makedirs(explicit_artifacts_dir, exist_ok=True)
+        return clean_id, os.path.abspath(explicit_artifacts_dir)
+
+    if not dataset_id or not str(dataset_id).strip():
+        if create_if_missing:
+            clean_id = f"dataset_{uuid.uuid4().hex[:8]}"
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="dataset_id is required.",
+            )
+    else:
+        clean_id = str(dataset_id).strip()
+
+    target_dir = os.path.join(BASE_ARTIFACTS_DIR, clean_id)
+    if not create_if_missing and not os.path.exists(target_dir):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Dataset artifacts directory not found for dataset_id='{clean_id}'. Has the dataset been uploaded or analyzed?",
+        )
+
+    os.makedirs(target_dir, exist_ok=True)
+    return clean_id, os.path.abspath(target_dir)
 
 
 class CleaningSummary(BaseModel):
@@ -48,6 +88,9 @@ class CleaningSummary(BaseModel):
 
 
 class CleanDatasetResponse(BaseModel):
+    dataset_id: Optional[str] = Field(
+        default=None, description="Dedicated dataset ID"
+    )
     artifact_path: str = Field(
         description="Absolute path to the cleaned CSV artifact"
     )
@@ -68,6 +111,9 @@ class ColumnProfile(BaseModel):
 
 
 class DatasetProfile(BaseModel):
+    dataset_id: Optional[str] = Field(
+        default=None, description="Dedicated dataset ID"
+    )
     row_count: int = Field(description="Total number of rows")
     column_count: int = Field(description="Total number of columns")
     columns: list[ColumnProfile] = Field(description="Per-column statistics")
@@ -105,6 +151,9 @@ class ConfidenceScoreResponse(BaseModel):
 
 
 class AnalyzeDatasetResponse(BaseModel):
+    dataset_id: Optional[str] = Field(
+        default=None, description="Dedicated dataset ID"
+    )
     profile: DatasetProfile = Field(description="Dataset profiling results")
     target_candidates: list[TargetCandidateResponse] = Field(
         description="Heuristic target candidates (always included for user review)"
@@ -177,6 +226,7 @@ class CollinearPair(BaseModel):
 
 class FeatureEngineeringResponse(BaseModel):
     """Response from /run-feature-engineering and /apply-collinearity-drop."""
+    dataset_id: Optional[str] = Field(default=None, description="Dedicated dataset ID")
     encoding_map: dict[str, str] = Field(description="Column name to transformation applied: onehot, label, ordinal, scaled, or excluded")
     collinear_pairs: list[CollinearPair] = Field(description="Column pairs with |correlation| > threshold; flagged only, not auto-dropped")
     excluded_columns: list[str] = Field(description="ID-like columns, target column, and caller-supplied exclusions")
@@ -185,12 +235,14 @@ class FeatureEngineeringResponse(BaseModel):
 
 
 class ApplyCollinearityDropRequest(BaseModel):
+    dataset_id: Optional[str] = Field(default=None, description="Dedicated dataset ID")
     artifact_path: str = Field(description="Path to an existing feature_engineered_vN.csv")
     columns_to_drop: list[str] = Field(description="Columns to remove from the feature matrix")
 
 
 class EDAResponse(BaseModel):
     """Response from the run-eda endpoint."""
+    dataset_id: Optional[str] = Field(default=None, description="Dedicated dataset ID")
     stats: Optional[EDAStats] = Field(
         default=None,
         description="Computed statistical summary, or None if computation failed",
@@ -237,6 +289,7 @@ async def clean_dataset_endpoint(
     file: UploadFile = File(...),
     target_column: Optional[str] = Form(None),
     cap_target: bool = Form(False),
+    dataset_id: Optional[str] = Form(None),
 ):
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(
@@ -272,14 +325,19 @@ async def clean_dataset_endpoint(
                 ),
             )
 
+    clean_id, artifacts_dir = resolve_dataset_artifacts_dir(
+        dataset_id=dataset_id, create_if_missing=True
+    )
+
     result = clean_dataset(
         df,
         target_column=target_column,
         cap_target=cap_target,
-        artifacts_dir="artifacts",
+        artifacts_dir=artifacts_dir,
     )
 
     return CleanDatasetResponse(
+        dataset_id=clean_id,
         artifact_path=result["artifact_path"],
         changelog_path=result["changelog_path"],
         summary=CleaningSummary(
@@ -293,7 +351,10 @@ async def clean_dataset_endpoint(
 
 
 @app.post("/profile-dataset", response_model=DatasetProfile)
-async def profile_dataset_endpoint(file: UploadFile = File(...)):
+async def profile_dataset_endpoint(
+    file: UploadFile = File(...),
+    dataset_id: Optional[str] = Form(None),
+):
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(
             status_code=400,
@@ -317,6 +378,11 @@ async def profile_dataset_endpoint(file: UploadFile = File(...)):
             detail="CSV has headers but no data rows. Please upload a dataset with at least one row.",
         )
 
+    clean_id, _ = resolve_dataset_artifacts_dir(
+        dataset_id=dataset_id, create_if_missing=True
+    )
+    result["dataset_id"] = clean_id
+
     return DatasetProfile(**result)
 
 
@@ -324,6 +390,7 @@ async def profile_dataset_endpoint(file: UploadFile = File(...)):
 async def analyze_dataset(
     file: UploadFile = File(...),
     user_selected_target: Optional[str] = Form(None),
+    dataset_id: Optional[str] = Form(None),
 ):
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(
@@ -399,7 +466,13 @@ async def analyze_dataset(
             heuristic_problem_type="unclear",
         )
 
+    clean_id, artifacts_dir = resolve_dataset_artifacts_dir(
+        dataset_id=dataset_id, create_if_missing=True
+    )
+    profile["dataset_id"] = clean_id
+
     saved_profile_payload = {
+        "dataset_id": clean_id,
         "profile": profile,
         "target_candidates": target_candidates,
         "target_source": target_source,
@@ -407,9 +480,10 @@ async def analyze_dataset(
         "problem_type_analysis": problem_type_analysis,
         "confidence_score": confidence_score,
     }
-    save_artifact(saved_profile_payload, "artifacts", "dataset_profile", "json")
+    save_artifact(saved_profile_payload, artifacts_dir, "dataset_profile", "json")
 
     return AnalyzeDatasetResponse(
+        dataset_id=clean_id,
         profile=DatasetProfile(**profile),
         target_candidates=[TargetCandidateResponse(**c) for c in target_candidates],
         target_source=target_source,
@@ -428,6 +502,7 @@ async def run_eda_endpoint(
     target_column: Optional[str] = Form(None),
     problem_type: Optional[str] = Form(None),
     cleaning_changelog_path: Optional[str] = Form(None),
+    dataset_id: Optional[str] = Form(None),
 ):
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(
@@ -477,12 +552,18 @@ async def run_eda_endpoint(
                 cleaning_changelog_path, exc,
             )
 
+    clean_id, artifacts_dir = resolve_dataset_artifacts_dir(
+        dataset_id=dataset_id, create_if_missing=True
+    )
+
     result = run_eda(
         df,
         target_column=target_column,
         problem_type=problem_type,
         cleaning_changelog=cleaning_changelog,
+        artifacts_dir=artifacts_dir,
     )
+    result["dataset_id"] = clean_id
 
     return EDAResponse(**result)
 
@@ -522,6 +603,7 @@ async def run_feature_engineering_endpoint(
     exclude_columns: Optional[str] = Form(None),
     ordinal_columns: Optional[str] = Form(None),
     cleaning_changelog_path: Optional[str] = Form(None),
+    dataset_id: Optional[str] = Form(None),
 ):
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(
@@ -601,6 +683,10 @@ async def run_feature_engineering_endpoint(
 
     additional_excludes = list(dict.fromkeys(additional_excludes))
 
+    clean_id, artifacts_dir = resolve_dataset_artifacts_dir(
+        dataset_id=dataset_id, create_if_missing=True
+    )
+
     start = time.perf_counter()
     try:
         result = build_feature_pipeline(
@@ -626,7 +712,6 @@ async def run_feature_engineering_endpoint(
 
     duration = time.perf_counter() - start
 
-    artifacts_dir = "artifacts"
     os.makedirs(artifacts_dir, exist_ok=True)
     version = get_next_version(artifacts_dir, "feature_engineered")
     csv_path = os.path.join(artifacts_dir, f"feature_engineered_v{version}.csv")
@@ -643,6 +728,7 @@ async def run_feature_engineering_endpoint(
         for p in result["collinear_pairs"]
     ]
     fe_summary = {
+        "dataset_id": clean_id,
         "columns": list(result["transformed_df"].columns),
         "dtypes": {str(c): str(t) for c, t in result["transformed_df"].dtypes.items()},
         "target_column": target_column,
@@ -659,6 +745,7 @@ async def run_feature_engineering_endpoint(
     log_agent_run(
         agent_name="feature_engineering",
         inputs_summary={
+            "dataset_id": clean_id,
             "target_column": target_column,
             "problem_type": problem_type,
             "rows": len(df),
@@ -675,6 +762,7 @@ async def run_feature_engineering_endpoint(
     )
 
     return FeatureEngineeringResponse(
+        dataset_id=clean_id,
         encoding_map=result["encoding_map"],
         collinear_pairs=[CollinearPair(**p) for p in result["collinear_pairs"]],
         excluded_columns=result["excluded_columns"],
@@ -710,8 +798,14 @@ async def apply_collinearity_drop_endpoint(
             detail=f"Columns not found in artifact: {missing_cols}",
         )
 
+    explicit_artifacts_dir = os.path.dirname(request.artifact_path)
+    clean_id, artifacts_dir = resolve_dataset_artifacts_dir(
+        dataset_id=request.dataset_id,
+        create_if_missing=False,
+        explicit_artifacts_dir=explicit_artifacts_dir if not request.dataset_id else None,
+    )
+
     next_version = _next_csv_version_from_path(request.artifact_path)
-    artifacts_dir = os.path.dirname(request.artifact_path) or "artifacts"
     csv_path = os.path.join(artifacts_dir, f"feature_engineered_v{next_version}.csv")
     pkl_path = os.path.join(artifacts_dir, f"pipeline_v{next_version}.pkl")
 
@@ -749,6 +843,7 @@ async def apply_collinearity_drop_endpoint(
         new_encoding_map[col] = "dropped"
 
     new_meta = {
+        "dataset_id": clean_id,
         "columns": list(df_dropped.columns),
         "dtypes": {str(c): str(t) for c, t in df_dropped.dtypes.items()},
         "target_column": orig_meta.get("target_column"),
@@ -771,6 +866,7 @@ async def apply_collinearity_drop_endpoint(
     log_agent_run(
         agent_name="collinearity_drop",
         inputs_summary={
+            "dataset_id": clean_id,
             "artifact_path": request.artifact_path,
             "columns_to_drop": request.columns_to_drop,
         },
@@ -782,6 +878,7 @@ async def apply_collinearity_drop_endpoint(
     )
 
     return FeatureEngineeringResponse(
+        dataset_id=clean_id,
         encoding_map=new_encoding_map,
         collinear_pairs=collinear_pairs,
         excluded_columns=excluded_columns,
@@ -796,6 +893,9 @@ class CandidateModelResponse(BaseModel):
 
 
 class MLPlanResponse(BaseModel):
+    dataset_id: Optional[str] = Field(
+        default=None, description="Dedicated dataset ID"
+    )
     problem_type: str = Field(
         description="Confirmed problem type: classification or regression"
     )
@@ -817,6 +917,9 @@ class MLPlanResponse(BaseModel):
 
 
 class PlanTrainingRequest(BaseModel):
+    dataset_id: Optional[str] = Field(
+        default=None, description="Dedicated dataset ID"
+    )
     state: Optional[dict[str, Any]] = Field(
         default=None, description="Shared pipeline state dictionary from earlier stages"
     )
@@ -847,6 +950,16 @@ async def plan_training_endpoint(
         else:
             state_dict = dict(request)
 
+        dataset_id = state_dict.get("dataset_id") or request.get("dataset_id")
+        explicit_artifacts_dir = state_dict.get("artifacts_dir") or request.get("artifacts_dir")
+        clean_id, artifacts_dir = resolve_dataset_artifacts_dir(
+            dataset_id=dataset_id,
+            create_if_missing=False,
+            explicit_artifacts_dir=explicit_artifacts_dir,
+        )
+        state_dict["dataset_id"] = clean_id
+        state_dict["artifacts_dir"] = artifacts_dir
+
         agent = MLPlanningAgent()
         result_state = agent.run(state_dict)
         plan = result_state.get("ml_plan")
@@ -854,6 +967,7 @@ async def plan_training_endpoint(
             raise ValueError("MLPlanningAgent did not produce an 'ml_plan' in state.")
 
         return MLPlanResponse(
+            dataset_id=clean_id,
             problem_type=plan["problem_type"],
             confirmation_reasoning=plan["confirmation_reasoning"],
             recommended_metric=plan["recommended_metric"],
@@ -863,6 +977,8 @@ async def plan_training_endpoint(
             ],
             artifact_path=result_state.get("ml_plan_artifact_path"),
         )
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(
             status_code=400,
@@ -888,6 +1004,7 @@ class TrainingSummaryResponse(BaseModel):
 
 
 class TrainModelsResponse(BaseModel):
+    dataset_id: Optional[str] = Field(default=None, description="Dedicated dataset ID")
     comparison_table: list[ModelTrainingResultResponse] = Field(description="Ranked list of model training results")
     artifact_path: str = Field(description="Path to saved training results JSON artifact")
     summary: TrainingSummaryResponse = Field(description="Overall training run summary")
@@ -903,6 +1020,16 @@ async def train_models_endpoint(
         else:
             state_dict = dict(request)
 
+        dataset_id = state_dict.get("dataset_id") or request.get("dataset_id")
+        explicit_artifacts_dir = state_dict.get("artifacts_dir") or request.get("artifacts_dir")
+        clean_id, artifacts_dir = resolve_dataset_artifacts_dir(
+            dataset_id=dataset_id,
+            create_if_missing=False,
+            explicit_artifacts_dir=explicit_artifacts_dir,
+        )
+        state_dict["dataset_id"] = clean_id
+        state_dict["artifacts_dir"] = artifacts_dir
+
         agent = TrainingAgent()
         result_state = agent.run(state_dict)
         results = result_state.get("training_results", [])
@@ -910,10 +1037,13 @@ async def train_models_endpoint(
         summary = result_state.get("training_summary", {})
 
         return TrainModelsResponse(
+            dataset_id=clean_id,
             comparison_table=[ModelTrainingResultResponse(**r) for r in results],
             artifact_path=artifact_path,
             summary=TrainingSummaryResponse(**summary),
         )
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(
             status_code=400,
@@ -927,6 +1057,7 @@ class SkippedVisualizationItem(BaseModel):
 
 
 class EvaluationResponse(BaseModel):
+    dataset_id: Optional[str] = Field(default=None, description="Dedicated dataset ID")
     winning_model_name: str = Field(description="Name of the winning model")
     problem_type: str = Field(description="Problem type (classification or regression)")
     recommended_metric: str = Field(description="Metric used for evaluation")
@@ -952,13 +1083,26 @@ async def evaluate_model_endpoint(
         else:
             state_dict = dict(request)
 
+        dataset_id = state_dict.get("dataset_id") or request.get("dataset_id")
+        explicit_artifacts_dir = state_dict.get("artifacts_dir") or request.get("artifacts_dir")
+        clean_id, artifacts_dir = resolve_dataset_artifacts_dir(
+            dataset_id=dataset_id,
+            create_if_missing=False,
+            explicit_artifacts_dir=explicit_artifacts_dir,
+        )
+        state_dict["dataset_id"] = clean_id
+        state_dict["artifacts_dir"] = artifacts_dir
+
         agent = EvaluationAgent()
         result_state = agent.run(state_dict)
         bundle = result_state.get("evaluation_bundle")
         if not bundle:
             raise ValueError("EvaluationAgent did not produce an 'evaluation_bundle' in state.")
 
+        bundle["dataset_id"] = clean_id
         return EvaluationResponse(**bundle)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(
             status_code=400,
@@ -976,6 +1120,16 @@ async def generate_report_endpoint(
         else:
             state_dict = dict(request)
 
+        dataset_id = state_dict.get("dataset_id") or request.get("dataset_id")
+        explicit_artifacts_dir = state_dict.get("artifacts_dir") or request.get("artifacts_dir")
+        clean_id, artifacts_dir = resolve_dataset_artifacts_dir(
+            dataset_id=dataset_id,
+            create_if_missing=False,
+            explicit_artifacts_dir=explicit_artifacts_dir,
+        )
+        state_dict["dataset_id"] = clean_id
+        state_dict["artifacts_dir"] = artifacts_dir
+
         agent = ReportAgent()
         result_state = agent.run(state_dict)
         report_path = result_state.get("report_pdf_path")
@@ -989,6 +1143,8 @@ async def generate_report_endpoint(
             filename=filename,
             headers={"Content-Disposition": f"inline; filename={filename}"},
         )
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(
             status_code=400,

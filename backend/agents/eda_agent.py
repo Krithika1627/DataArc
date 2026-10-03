@@ -587,11 +587,13 @@ def generate_boxplots(
 @with_agent_logging("eda_orchestration")
 def run_eda(
     df: pd.DataFrame,
+    artifacts_dir: str,
     target_column: str | None = None,
     problem_type: str | None = None,
-    artifacts_dir: str = "artifacts",
     cleaning_changelog: dict | None = None,
 ) -> dict[str, Any]:
+    if not artifacts_dir or not str(artifacts_dir).strip():
+        raise ValueError("artifacts_dir must be provided and non-empty.")
     id_columns = identify_id_columns(df)
     exclude = set(id_columns)
 

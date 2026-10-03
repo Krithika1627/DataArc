@@ -35,10 +35,28 @@ except ImportError:
     from training_agent import TrainingAgent
 
 
+def _resolve_artifacts_dir(state: dict) -> str:
+    artifacts_dir = state.get("artifacts_dir")
+    if not artifacts_dir:
+        dataset_id = state.get("dataset_id")
+        if not dataset_id:
+            import uuid
+            dataset_id = f"dataset_{uuid.uuid4().hex[:8]}"
+            state["dataset_id"] = dataset_id
+        try:
+            from agents.versioning_utils import get_dataset_artifacts_dir
+        except ImportError:
+            from versioning_utils import get_dataset_artifacts_dir
+        artifacts_dir = get_dataset_artifacts_dir("artifacts", dataset_id)
+    os.makedirs(artifacts_dir, exist_ok=True)
+    state["artifacts_dir"] = artifacts_dir
+    return artifacts_dir
+
+
 class DatasetUnderstandingAgent(BaseAgent):
     def run(self, state: dict) -> dict:
         df: pd.DataFrame = state["df"]
-        artifacts_dir: str = state.get("artifacts_dir", "artifacts")
+        artifacts_dir: str = _resolve_artifacts_dir(state)
 
         profile = profile_dataset(df)
 
@@ -111,7 +129,7 @@ class CleaningAgent(BaseAgent):
     def run(self, state: dict) -> dict:
         df: pd.DataFrame = state["df"]
         target_column: str | None = state.get("selected_target")
-        artifacts_dir: str = state.get("artifacts_dir", "artifacts")
+        artifacts_dir: str = _resolve_artifacts_dir(state)
 
         result = clean_dataset(
             df,
@@ -135,7 +153,7 @@ class EDAAgent(BaseAgent):
         cleaned_df: pd.DataFrame = state["cleaned_df"]
         target_column: str | None = state.get("selected_target")
         problem_type: str | None = state.get("problem_type_analysis", {}).get("problem_type")
-        artifacts_dir: str = state.get("artifacts_dir", "artifacts")
+        artifacts_dir: str = _resolve_artifacts_dir(state)
 
         cleaning_changelog = None
         changelog_path = state.get("cleaning_changelog_path")
@@ -162,7 +180,7 @@ class FeatureEngineeringAgent(BaseAgent):
         target_column: str = state["selected_target"]
         problem_type: str = state["problem_type_analysis"]["problem_type"]
         ordinal_columns: dict[str, list[str]] | None = state.get("ordinal_columns")
-        artifacts_dir: str = state.get("artifacts_dir", "artifacts")
+        artifacts_dir: str = _resolve_artifacts_dir(state)
 
         high_missing_cols: list[str] = []
         changelog_path = state.get("cleaning_changelog_path")

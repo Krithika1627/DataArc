@@ -58,7 +58,9 @@ except ImportError:
 logger = logging.getLogger("agent_runs")
 
 
-def load_all_pipeline_artifacts(artifacts_dir: str = "artifacts") -> dict[str, Any]:
+def load_all_pipeline_artifacts(artifacts_dir: str) -> dict[str, Any]:
+    if not artifacts_dir or not str(artifacts_dir).strip():
+        raise ValueError("artifacts_dir must be provided and non-empty.")
     required_artifacts = [
         ("dataset_profile", "json", "Dataset Understanding (Week 1)"),
         ("cleaned", "changelog_json", "Data Cleaning (Week 2)"),
@@ -623,7 +625,19 @@ class ReportAgent(BaseAgent):
         if state is None:
             state = {}
 
-        artifacts_dir = state.get("artifacts_dir", "artifacts")
+        artifacts_dir = state.get("artifacts_dir")
+        if not artifacts_dir:
+            dataset_id = state.get("dataset_id")
+            if dataset_id:
+                try:
+                    from agents.versioning_utils import get_dataset_artifacts_dir
+                except ImportError:
+                    from versioning_utils import get_dataset_artifacts_dir
+                artifacts_dir = get_dataset_artifacts_dir("artifacts", dataset_id)
+            else:
+                raise ValueError("artifacts_dir or dataset_id must be provided in state.")
+        state["artifacts_dir"] = artifacts_dir
+
         start_agent_time = time.perf_counter()
 
         # Step 1: Load all pipeline stage artifacts

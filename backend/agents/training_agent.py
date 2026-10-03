@@ -111,8 +111,10 @@ def get_estimator(model_name: str, problem_type: str) -> Any | None:
     return estimator
 
 
-def load_training_inputs(artifacts_dir: str = "artifacts") -> dict[str, Any]:
+def load_training_inputs(artifacts_dir: str) -> dict[str, Any]:
     """Load latest feature-engineered dataset, metadata, cleaned target, and ML plan from artifacts."""
+    if not artifacts_dir or not str(artifacts_dir).strip():
+        raise ValueError("artifacts_dir must be provided and non-empty.")
     fe_csv_path = get_latest_version_path(
         artifacts_dir, "feature_engineered", "csv"
     )
@@ -251,7 +253,19 @@ class TrainingAgent(BaseAgent):
         if state is None:
             state = {}
 
-        artifacts_dir = state.get("artifacts_dir", "artifacts")
+        artifacts_dir = state.get("artifacts_dir")
+        if not artifacts_dir:
+            dataset_id = state.get("dataset_id")
+            if dataset_id:
+                try:
+                    from agents.versioning_utils import get_dataset_artifacts_dir
+                except ImportError:
+                    from versioning_utils import get_dataset_artifacts_dir
+                artifacts_dir = get_dataset_artifacts_dir("artifacts", dataset_id)
+            else:
+                raise ValueError("artifacts_dir or dataset_id must be provided in state.")
+        state["artifacts_dir"] = artifacts_dir
+
         start_agent_time = time.perf_counter()
 
         # Load inputs from state or artifacts

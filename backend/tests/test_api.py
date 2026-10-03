@@ -310,7 +310,7 @@ class TestRunFeatureEngineering:
         v1_mtime = os.path.getmtime(v1_csv)
 
         # Second call -> v2
-        resp2 = _run_fe(df, target_column="survived")
+        resp2 = _run_fe(df, target_column="survived", dataset_id=data1["dataset_id"])
         assert resp2.status_code == 200
         data2 = resp2.json()
         assert "feature_engineered_v2.csv" in data2["artifact_path"]
