@@ -473,6 +473,7 @@ class TestComputeConfidenceScore:
         without modifying existing profile fields."""
         import json
         from agents.pipeline_agents import DatasetUnderstandingAgent
+        from agents.versioning_utils import get_latest_version_path
 
         artifacts_dir = str(tmp_path / "artifacts")
         state = {
@@ -488,11 +489,11 @@ class TestComputeConfidenceScore:
         assert "breakdown" in cs
         assert len(cs["breakdown"]) == 4
 
-        artifact_file = result_state["dataset_profile_artifact_path"]
-        with open(artifact_file, "r") as f:
-            artifact_data = json.load(f)
+        artifact_data = get_latest_version_path(artifacts_dir, "dataset_profile", "json")
+        assert artifact_data is not None
 
         assert "confidence_score" in artifact_data
+
         assert "profile" in artifact_data
         assert "target_candidates" in artifact_data
         assert "selected_target" in artifact_data

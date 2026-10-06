@@ -678,15 +678,20 @@ def run_eda(
             result["errors"]["insights"] = str(exc)
 
     try:
-        from agents.versioning_utils import get_next_version
+        from agents.versioning_utils import get_next_version, save_artifact
     except ImportError:
-        from versioning_utils import get_next_version
+        from versioning_utils import get_next_version, save_artifact
 
-    os.makedirs(artifacts_dir, exist_ok=True)
     version = get_next_version(artifacts_dir, "eda_bundle")
-    bundle_path = os.path.join(artifacts_dir, f"eda_bundle_v{version}.json")
-    with open(bundle_path, "w") as f:
-        json.dump(result, f, indent=2, default=str)
-    result["artifact_path"] = os.path.abspath(bundle_path)
+    try:
+        os.makedirs(artifacts_dir, exist_ok=True)
+        bundle_path = os.path.join(artifacts_dir, f"eda_bundle_v{version}.json")
+        with open(bundle_path, "w") as f:
+            json.dump(result, f, indent=2, default=str)
+        result["artifact_path"] = os.path.abspath(bundle_path)
+    except Exception:
+        result["artifact_path"] = f"eda_bundle_v{version}.json"
+
+    save_artifact(result, artifacts_dir, "eda_bundle", "json", version=version)
 
     return result

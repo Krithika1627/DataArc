@@ -21,7 +21,13 @@ from agents.pipeline_agents import (
     TrainingAgent,
 )
 from agents.report_agent import ReportAgent, build_report_html, load_all_pipeline_artifacts
-from agents.versioning_utils import get_latest_version_path, save_artifact
+from agents.versioning_utils import (
+    get_db_engine,
+    _clean_dataset_id,
+    get_latest_version_path,
+    save_artifact,
+)
+from sqlalchemy import text
 from main import app
 
 
@@ -124,8 +130,13 @@ class TestReportAgent:
         )
 
         # Delete evaluation_bundle artifact to simulate missing evaluation stage
-        eval_path = get_latest_version_path(artifacts_dir, "evaluation_bundle", "json")
-        os.remove(eval_path)
+        clean_id = _clean_dataset_id(artifacts_dir)
+        with get_db_engine().connect() as conn:
+            with conn.begin():
+                conn.execute(
+                    text("DELETE FROM artifacts WHERE dataset_id = :d AND artifact_type = 'evaluation_bundle'"),
+                    {"d": clean_id},
+                )
 
         agent = ReportAgent()
         with pytest.raises(FileNotFoundError, match="Model Evaluation"):

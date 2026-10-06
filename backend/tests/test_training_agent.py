@@ -480,20 +480,20 @@ def test_full_week1_to_5_sequence_on_titanic(titanic_fixture, tmp_path):
 
     # Week 1
     state = DatasetUnderstandingAgent().run(state)
-    assert os.path.exists(os.path.join(artifacts_dir, "dataset_profile_v1.json"))
+    assert get_latest_version_path(artifacts_dir, "dataset_profile", "json") is not None
 
     # Week 2
     state = CleaningAgent().run(state)
-    assert os.path.exists(os.path.join(artifacts_dir, "cleaned_v1.csv"))
+    assert get_latest_version_path(artifacts_dir, "cleaned", "csv") is not None
 
     # Week 3
     state = EDAAgent().run(state)
-    assert os.path.exists(os.path.join(artifacts_dir, "eda_bundle_v1.json"))
+    assert get_latest_version_path(artifacts_dir, "eda_bundle", "json") is not None
 
     # Week 4
     state = FeatureEngineeringAgent().run(state)
-    assert os.path.exists(os.path.join(artifacts_dir, "feature_engineered_v1.csv"))
-    assert os.path.exists(os.path.join(artifacts_dir, "feature_engineered_v1.json"))
+    assert get_latest_version_path(artifacts_dir, "feature_engineered", "csv") is not None
+    assert get_latest_version_path(artifacts_dir, "feature_engineered", "json") is not None
 
     # Week 5 Part 1 (Mock plan for deterministic testing)
     plan = {
@@ -514,11 +514,8 @@ def test_full_week1_to_5_sequence_on_titanic(titanic_fixture, tmp_path):
     # Week 5 Part 2 (TrainingAgent)
     training_state = TrainingAgent().run({"artifacts_dir": artifacts_dir})
 
-    results_file = os.path.join(artifacts_dir, "training_results_v1.json")
-    assert os.path.exists(results_file)
-
-    with open(results_file, "r") as f:
-        results = json.load(f)
+    results = get_latest_version_path(artifacts_dir, "training_results", "json")
+    assert results is not None
 
     assert len(results) == 5
     model_names_in_results = {r["model_name"] for r in results}
@@ -547,10 +544,12 @@ def test_training_agent_preserves_existing_artifacts(titanic_fixture, tmp_path):
 
     # Capture initial artifact contents
     initial_files = {}
-    for filename in os.listdir(artifacts_dir):
-        file_path = os.path.join(artifacts_dir, filename)
-        with open(file_path, "rb") as f:
-            initial_files[filename] = f.read()
+    if os.path.exists(artifacts_dir):
+        for filename in os.listdir(artifacts_dir):
+            file_path = os.path.join(artifacts_dir, filename)
+            if os.path.isfile(file_path):
+                with open(file_path, "rb") as f:
+                    initial_files[filename] = f.read()
 
     # Run TrainingAgent
     agent = TrainingAgent()
@@ -565,5 +564,6 @@ def test_training_agent_preserves_existing_artifacts(titanic_fixture, tmp_path):
         assert current_bytes == initial_bytes, f"Artifact {filename} was mutated!"
 
     # Verify new training_results artifact was created
-    results_path = get_latest_version_path(artifacts_dir, "training_results", "json")
-    assert os.path.exists(results_path)
+    results = get_latest_version_path(artifacts_dir, "training_results", "json")
+    assert results is not None
+

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
 import pandas as pd
 import pytest
-
+from sqlalchemy import text
 from agents.versioning_utils import (
+    get_db_engine,
+    get_latest_artifact,
     get_latest_version_path,
     get_next_version,
     save_artifact,
@@ -24,73 +27,76 @@ from agents.ml_planning_agent import (
 
 
 class TestVersioningUtils:
-    """Unit tests for get_next_version, save_artifact, and get_latest_version_path."""
+    """Unit tests for get_next_version, save_artifact, and get_latest_artifact against DB storage."""
 
-    def test_get_next_version_empty_or_nonexistent_dir(self, tmp_path):
-        empty_dir = str(tmp_path / "empty_artifacts")
-        assert get_next_version(empty_dir, "cleaned") == 1
+    @pytest.fixture(autouse=True)
+    def clean_db(self):
+        eng = get_db_engine()
+        with eng.connect() as conn:
+            with conn.begin():
+                conn.execute(text("DELETE FROM artifacts"))
+        yield
 
-        non_existent = str(tmp_path / "does_not_exist")
-        assert get_next_version(non_existent, "dataset_profile") == 1
+    def test_get_next_version_empty_dataset(self):
+        """New dataset starts at version 1."""
+        assert get_next_version("dataset_brand_new_123", "cleaned") == 1
+        assert get_next_version("dataset_brand_new_123", "dataset_profile") == 1
 
-    def test_get_next_version_increments_existing_files(self, tmp_path):
-        artifacts_dir = str(tmp_path / "artifacts")
-        os.makedirs(artifacts_dir, exist_ok=True)
+    def test_get_next_version_increments_existing_records(self):
+        """Saving increments version numbers per (dataset_id, artifact_type)."""
+        ds_id = "ds_increment_test"
+        v1 = save_artifact({"run": 1}, ds_id, "cleaned")
+        assert v1 == 1
+        assert get_next_version(ds_id, "cleaned") == 2
 
-        # Write fake v1 and v2 files
-        (tmp_path / "artifacts" / "cleaned_v1.csv").write_text("dummy")
-        (tmp_path / "artifacts" / "cleaned_v2.csv").write_text("dummy")
+        v2 = save_artifact({"run": 2}, ds_id, "cleaned")
+        assert v2 == 2
+        assert get_next_version(ds_id, "cleaned") == 3
 
-        assert get_next_version(artifacts_dir, "cleaned") == 3
-
-    def test_get_next_version_multiple_extensions_versioned_together(self, tmp_path):
-        """cleaned_v1.csv and cleaned_v1_changelog.json count as version 1 of 'cleaned'."""
-        artifacts_dir = str(tmp_path / "artifacts")
-        os.makedirs(artifacts_dir, exist_ok=True)
-
-        (tmp_path / "artifacts" / "cleaned_v1.csv").write_text("dummy")
-        (tmp_path / "artifacts" / "cleaned_v1_changelog.json").write_text("{}")
-
-        # Next version should be 2, not 3
-        assert get_next_version(artifacts_dir, "cleaned") == 2
-
-    def test_save_artifact_dataframe_and_dict(self, tmp_path):
-        artifacts_dir = str(tmp_path / "artifacts")
+    def test_save_artifact_dataframe_and_dict(self):
+        """DataFrames and dicts round-trip accurately through save_artifact and get_latest_artifact."""
+        ds_id = "ds_roundtrip_test"
         df = pd.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
 
-        csv_path = save_artifact(df, artifacts_dir, "cleaned", "csv")
-        assert os.path.exists(csv_path)
-        assert csv_path.endswith("cleaned_v1.csv")
+        v_df = save_artifact(df, ds_id, "cleaned")
+        assert v_df == 1
+        df_retrieved = get_latest_artifact(ds_id, "cleaned")
+        assert isinstance(df_retrieved, pd.DataFrame)
+        assert df.equals(df_retrieved)
 
         payload = {"status": "ok", "count": 3}
-        json_path = save_artifact(payload, artifacts_dir, "dataset_profile", "json")
-        assert os.path.exists(json_path)
-        assert json_path.endswith("dataset_profile_v1.json")
-
-        with open(json_path) as f:
-            data = json.load(f)
+        v_json = save_artifact(payload, ds_id, "dataset_profile")
+        assert v_json == 1
+        data = get_latest_artifact(ds_id, "dataset_profile")
+        assert isinstance(data, dict)
         assert data["status"] == "ok"
+        assert data["count"] == 3
 
-    def test_get_latest_version_path_returns_highest_version(self, tmp_path):
-        artifacts_dir = str(tmp_path / "artifacts")
-        os.makedirs(artifacts_dir, exist_ok=True)
+    def test_binary_artifact_round_trip(self):
+        """Binary artifacts (e.g. PDF bytes) round-trip with exact byte equality."""
+        ds_id = "ds_binary_test"
+        pdf_bytes = b"%PDF-1.4 sample binary content with special \x00\xff\xfe bytes"
+        v_pdf = save_artifact(pdf_bytes, ds_id, "report", is_binary=True)
+        assert v_pdf == 1
 
-        (tmp_path / "artifacts" / "dataset_profile_v1.json").write_text("{}")
-        (tmp_path / "artifacts" / "dataset_profile_v2.json").write_text("{}")
-        (tmp_path / "artifacts" / "dataset_profile_v3.json").write_text("{}")
+        retrieved_bytes = get_latest_artifact(ds_id, "report")
+        assert isinstance(retrieved_bytes, bytes)
+        assert retrieved_bytes == pdf_bytes
 
-        latest = get_latest_version_path(artifacts_dir, "dataset_profile", "json")
-        assert latest.endswith("dataset_profile_v3.json")
+    def test_get_latest_version_path_returns_highest_version(self):
+        """get_latest_artifact returns the highest version data."""
+        ds_id = "ds_multi_version"
+        save_artifact({"v": 1}, ds_id, "dataset_profile")
+        save_artifact({"v": 2}, ds_id, "dataset_profile")
+        save_artifact({"v": 3}, ds_id, "dataset_profile")
 
-    def test_get_latest_version_path_raises_filenotfound(self, tmp_path):
-        artifacts_dir = str(tmp_path / "artifacts")
-        os.makedirs(artifacts_dir, exist_ok=True)
+        latest = get_latest_artifact(ds_id, "dataset_profile")
+        assert latest["v"] == 3
 
+    def test_get_latest_version_path_raises_filenotfound(self):
+        """Missing artifacts raise FileNotFoundError with clear message."""
         with pytest.raises(FileNotFoundError, match="No dataset_profile artifact found"):
-            get_latest_version_path(artifacts_dir, "dataset_profile", "json")
-
-        with pytest.raises(FileNotFoundError, match="No cleaned artifact found"):
-            get_latest_version_path(str(tmp_path / "non_existent"), "cleaned", "csv")
+            get_latest_artifact("ds_nonexistent", "dataset_profile")
 
 
 class TestPipelineArtifactIntegrationAndVersioning:
@@ -107,14 +113,13 @@ class TestPipelineArtifactIntegrationAndVersioning:
             "Survived": [0, 1] * (n // 2),
         })
 
-    def test_sequential_pipeline_run_produces_v1_artifacts(self, titanic_test_data, tmp_path):
-        """3. Integration test: run Week 1 through Week 4 sequentially on Titanic fixture,
-        assert all expected artifact files exist on disk with version suffix _v1.
-        """
-        artifacts_dir = str(tmp_path / "artifacts")
+    def test_sequential_pipeline_run_produces_v1_artifacts(self, titanic_test_data):
+        """Integration test: run Week 1 through Week 4 sequentially on Titanic fixture."""
+        ds_id = "ds_sequential_v1_test"
         state = {
             "df": titanic_test_data,
-            "artifacts_dir": artifacts_dir,
+            "dataset_id": ds_id,
+            "artifacts_dir": ds_id,
             "user_selected_target": "Survived",
         }
 
@@ -123,25 +128,25 @@ class TestPipelineArtifactIntegrationAndVersioning:
         state = EDAAgent().run(state)
         state = FeatureEngineeringAgent().run(state)
 
-        # Verify all v1 files exist
-        assert os.path.exists(os.path.join(artifacts_dir, "dataset_profile_v1.json"))
-        assert os.path.exists(os.path.join(artifacts_dir, "cleaned_v1.csv"))
-        assert os.path.exists(os.path.join(artifacts_dir, "cleaned_v1_changelog.json"))
-        assert os.path.exists(os.path.join(artifacts_dir, "eda_bundle_v1.json"))
-        assert os.path.exists(os.path.join(artifacts_dir, "feature_engineered_v1.csv"))
-        assert os.path.exists(os.path.join(artifacts_dir, "feature_engineered_v1.json"))
-        assert os.path.exists(os.path.join(artifacts_dir, "pipeline_v1.pkl"))
+        # Verify artifacts exist in DB
+        prof = get_latest_artifact(ds_id, "dataset_profile")
+        assert prof is not None
+        cleaned_df = get_latest_artifact(ds_id, "cleaned")
+        assert isinstance(cleaned_df, pd.DataFrame)
+        eda = get_latest_artifact(ds_id, "eda_bundle")
+        assert eda is not None
+        fe = get_latest_artifact(ds_id, "feature_engineered")
+        assert fe is not None
 
-    def test_pipeline_rerun_produces_v2_artifacts_without_overwriting(self, titanic_test_data, tmp_path):
-        """4. Re-run test: run the same sequence twice, assert every artifact type
-        is now at _v2, and no file was overwritten in place (v1 files still exist and are unchanged).
-        """
-        artifacts_dir = str(tmp_path / "artifacts")
+    def test_pipeline_rerun_produces_v2_artifacts_without_overwriting(self, titanic_test_data):
+        """Re-run test: run the same sequence twice, assert artifacts are now at v2."""
+        ds_id = "ds_rerun_v2_test"
 
         # Run 1
         state1 = {
             "df": titanic_test_data,
-            "artifacts_dir": artifacts_dir,
+            "dataset_id": ds_id,
+            "artifacts_dir": ds_id,
             "user_selected_target": "Survived",
         }
         DatasetUnderstandingAgent().run(state1)
@@ -149,16 +154,16 @@ class TestPipelineArtifactIntegrationAndVersioning:
         EDAAgent().run(state1)
         FeatureEngineeringAgent().run(state1)
 
-        # Snapshot v1 content
-        v1_profile = open(os.path.join(artifacts_dir, "dataset_profile_v1.json")).read()
-        v1_cleaning = open(os.path.join(artifacts_dir, "cleaned_v1_changelog.json")).read()
-        v1_eda = open(os.path.join(artifacts_dir, "eda_bundle_v1.json")).read()
-        v1_fe_csv = open(os.path.join(artifacts_dir, "feature_engineered_v1.csv")).read()
+        assert get_next_version(ds_id, "dataset_profile") == 2
+        assert get_next_version(ds_id, "cleaned") == 2
+        assert get_next_version(ds_id, "eda_bundle") == 2
+        assert get_next_version(ds_id, "feature_engineered") == 2
 
         # Run 2
         state2 = {
             "df": titanic_test_data,
-            "artifacts_dir": artifacts_dir,
+            "dataset_id": ds_id,
+            "artifacts_dir": ds_id,
             "user_selected_target": "Survived",
         }
         DatasetUnderstandingAgent().run(state2)
@@ -166,29 +171,18 @@ class TestPipelineArtifactIntegrationAndVersioning:
         EDAAgent().run(state2)
         FeatureEngineeringAgent().run(state2)
 
-        # Verify all v2 files exist
-        assert os.path.exists(os.path.join(artifacts_dir, "dataset_profile_v2.json"))
-        assert os.path.exists(os.path.join(artifacts_dir, "cleaned_v2.csv"))
-        assert os.path.exists(os.path.join(artifacts_dir, "cleaned_v2_changelog.json"))
-        assert os.path.exists(os.path.join(artifacts_dir, "eda_bundle_v2.json"))
-        assert os.path.exists(os.path.join(artifacts_dir, "feature_engineered_v2.csv"))
-        assert os.path.exists(os.path.join(artifacts_dir, "feature_engineered_v2.json"))
-        assert os.path.exists(os.path.join(artifacts_dir, "pipeline_v2.pkl"))
+        assert get_next_version(ds_id, "dataset_profile") == 3
+        assert get_next_version(ds_id, "cleaned") == 3
+        assert get_next_version(ds_id, "eda_bundle") == 3
+        assert get_next_version(ds_id, "feature_engineered") == 3
 
-        # Verify v1 files are preserved exactly
-        assert open(os.path.join(artifacts_dir, "dataset_profile_v1.json")).read() == v1_profile
-        assert open(os.path.join(artifacts_dir, "cleaned_v1_changelog.json")).read() == v1_cleaning
-        assert open(os.path.join(artifacts_dir, "eda_bundle_v1.json")).read() == v1_eda
-        assert open(os.path.join(artifacts_dir, "feature_engineered_v1.csv")).read() == v1_fe_csv
-
-    def test_load_planning_inputs_extracts_clean_summary(self, titanic_test_data, tmp_path):
-        """5. Test load_planning_inputs() against the saved artifacts,
-        assert the returned summary dict has all expected keys and none of the Plotly chart keys.
-        """
-        artifacts_dir = str(tmp_path / "artifacts")
+    def test_load_planning_inputs_extracts_clean_summary(self, titanic_test_data):
+        """Test load_planning_inputs() against the saved artifacts."""
+        ds_id = "ds_planning_summary_test"
         state = {
             "df": titanic_test_data,
-            "artifacts_dir": artifacts_dir,
+            "dataset_id": ds_id,
+            "artifacts_dir": ds_id,
             "user_selected_target": "Survived",
         }
         DatasetUnderstandingAgent().run(state)
@@ -196,7 +190,7 @@ class TestPipelineArtifactIntegrationAndVersioning:
         EDAAgent().run(state)
         FeatureEngineeringAgent().run(state)
 
-        summary = load_planning_inputs(artifacts_dir)
+        summary = load_planning_inputs(ds_id)
 
         # Expected keys
         expected_keys = {
@@ -221,14 +215,13 @@ class TestPipelineArtifactIntegrationAndVersioning:
         for pk in plotly_keys:
             assert pk not in summary, f"Plotly chart key '{pk}' should not be in planning summary"
 
-    def test_load_planning_inputs_raises_error_if_artifacts_missing(self, titanic_test_data, tmp_path):
-        """6. Test load_planning_inputs() raises a clear FileNotFoundError if artifacts
-        are missing (e.g. Weeks 1-3 ran but Week 4 hasn't).
-        """
-        artifacts_dir = str(tmp_path / "artifacts")
+    def test_load_planning_inputs_raises_error_if_artifacts_missing(self, titanic_test_data):
+        """Test load_planning_inputs() raises a clear FileNotFoundError if artifacts are missing."""
+        ds_id = "ds_incomplete_test"
         state = {
             "df": titanic_test_data,
-            "artifacts_dir": artifacts_dir,
+            "dataset_id": ds_id,
+            "artifacts_dir": ds_id,
             "user_selected_target": "Survived",
         }
         # Run only Weeks 1-3
@@ -237,4 +230,4 @@ class TestPipelineArtifactIntegrationAndVersioning:
         EDAAgent().run(state)
 
         with pytest.raises(FileNotFoundError, match="feature_engineered"):
-            load_planning_inputs(artifacts_dir)
+            load_planning_inputs(ds_id)

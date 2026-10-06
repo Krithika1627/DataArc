@@ -383,7 +383,7 @@ REQUIREMENTS:
     try:
         client = genai.Client(api_key=api_key)
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.1-flash-lite",
             contents=prompt,
         )
         text = response.text or ""
@@ -445,9 +445,14 @@ class EvaluationAgent(BaseAgent):
             eda_summary = state.get("eda_summary")
         else:
             # Load from artifacts
-            tr_path = get_latest_version_path(artifacts_dir, "training_results", "json")
-            with open(tr_path, "r") as f:
-                training_results = json.load(f)
+            tr_raw = get_latest_version_path(artifacts_dir, "training_results", "json")
+            if isinstance(tr_raw, (dict, list)):
+                training_results = tr_raw
+            elif isinstance(tr_raw, str) and os.path.exists(tr_raw):
+                with open(tr_raw, "r") as f:
+                    training_results = json.load(f)
+            else:
+                training_results = json.loads(tr_raw) if isinstance(tr_raw, str) else tr_raw
 
             train_inputs = load_training_inputs(artifacts_dir)
             X = train_inputs["X"]
@@ -460,19 +465,29 @@ class EvaluationAgent(BaseAgent):
             # Optional dataset profile & confidence score
             confidence_score = None
             try:
-                prof_path = get_latest_version_path(artifacts_dir, "dataset_profile", "json")
-                with open(prof_path, "r") as f:
-                    prof_data = json.load(f)
-                    confidence_score = prof_data.get("confidence_score")
+                prof_raw = get_latest_version_path(artifacts_dir, "dataset_profile", "json")
+                if isinstance(prof_raw, dict):
+                    prof_data = prof_raw
+                elif isinstance(prof_raw, str) and os.path.exists(prof_raw):
+                    with open(prof_raw, "r") as f:
+                        prof_data = json.load(f)
+                else:
+                    prof_data = json.loads(prof_raw) if isinstance(prof_raw, str) else prof_raw
+                confidence_score = prof_data.get("confidence_score")
             except Exception:
                 pass
 
             eda_summary = None
             try:
-                eda_path = get_latest_version_path(artifacts_dir, "eda_bundle", "json")
-                with open(eda_path, "r") as f:
-                    eda_data = json.load(f)
-                    eda_summary = eda_data.get("insights")
+                eda_raw = get_latest_version_path(artifacts_dir, "eda_bundle", "json")
+                if isinstance(eda_raw, dict):
+                    eda_data = eda_raw
+                elif isinstance(eda_raw, str) and os.path.exists(eda_raw):
+                    with open(eda_raw, "r") as f:
+                        eda_data = json.load(f)
+                else:
+                    eda_data = json.loads(eda_raw) if isinstance(eda_raw, str) else eda_raw
+                eda_summary = eda_data.get("insights")
             except Exception:
                 pass
 
@@ -621,13 +636,29 @@ class EvaluationAgent(BaseAgent):
             "skipped_visualizations": skipped_visualizations,
         }
 
-        artifact_path = save_artifact(
+        version = get_next_version(artifacts_dir, "evaluation_bundle")
+        save_artifact(
             bundle,
             artifacts_dir,
             "evaluation_bundle",
             "json",
+            version=version,
         )
-        bundle["artifact_path"] = artifact_path
+
+        bundle_file = f"evaluation_bundle_v{version}.json"
+        try:
+            if isinstance(artifacts_dir, str) and (
+                "/" in artifacts_dir or "\\" in artifacts_dir or os.path.exists(artifacts_dir)
+            ):
+                os.makedirs(artifacts_dir, exist_ok=True)
+                local_json = os.path.join(artifacts_dir, bundle_file)
+                with open(local_json, "w", encoding="utf-8") as f:
+                    json.dump(bundle, f, indent=2, default=str)
+                bundle_file = os.path.abspath(local_json)
+        except Exception:
+            pass
+
+        bundle["artifact_path"] = str(bundle_file)
 
         # Step 8: Log agent run
         total_duration = time.perf_counter() - start_agent_time
@@ -654,6 +685,7 @@ class EvaluationAgent(BaseAgent):
         # Update state
         state["evaluation_bundle"] = bundle
         state["winning_model_name"] = winning_model_name
-        state["evaluation_artifact_path"] = artifact_path
+        state["evaluation_artifact_path"] = bundle["artifact_path"]
 
         return state
+

@@ -63,7 +63,7 @@ def load_all_pipeline_artifacts(artifacts_dir: str) -> dict[str, Any]:
         raise ValueError("artifacts_dir must be provided and non-empty.")
     required_artifacts = [
         ("dataset_profile", "json", "Dataset Understanding (Week 1)"),
-        ("cleaned", "changelog_json", "Data Cleaning (Week 2)"),
+        ("cleaned_changelog", "json", "Data Cleaning (Week 2)"),
         ("eda_bundle", "json", "Exploratory Data Analysis (Week 3)"),
         ("feature_engineered", "json", "Feature Engineering (Week 4)"),
         ("ml_plan", "json", "ML Planning (Week 5 Part 1)"),
@@ -76,25 +76,26 @@ def load_all_pipeline_artifacts(artifacts_dir: str) -> dict[str, Any]:
 
     for base_name, ext, stage_desc in required_artifacts:
         try:
-            if ext == "changelog_json":
-                pattern = re.compile(rf"^{re.escape(base_name)}_v(\d+)_changelog\.json$")
-                if not os.path.exists(artifacts_dir):
-                    raise FileNotFoundError()
-                matched = []
-                for fname in os.listdir(artifacts_dir):
-                    m = pattern.match(fname)
-                    if m:
-                        matched.append((int(m.group(1)), fname))
-                if not matched:
-                    raise FileNotFoundError()
-                matched.sort(key=lambda x: (x[0], x[1]))
-                fpath = os.path.join(artifacts_dir, matched[-1][1])
-            else:
-                fpath = get_latest_version_path(artifacts_dir, base_name, ext)
+            fpath = get_latest_version_path(artifacts_dir, base_name, ext)
 
-            with open(fpath, "r", encoding="utf-8") as f:
-                loaded_data[base_name] = json.load(f)
-            artifact_versions[base_name] = os.path.basename(fpath)
+            key_name = "cleaned" if base_name == "cleaned_changelog" else base_name
+            ver_label = "cleaned_v1_changelog.json" if key_name == "cleaned" else f"{key_name}_v1.json"
+            if isinstance(fpath, dict):
+                loaded_data[key_name] = fpath
+                artifact_versions[key_name] = ver_label
+            elif isinstance(fpath, str) and os.path.exists(fpath):
+                with open(fpath, "r", encoding="utf-8") as f:
+                    loaded_data[key_name] = json.load(f)
+                artifact_versions[key_name] = os.path.basename(fpath)
+            elif isinstance(fpath, str):
+                try:
+                    loaded_data[key_name] = json.loads(fpath)
+                except Exception:
+                    loaded_data[key_name] = fpath
+                artifact_versions[key_name] = ver_label
+            else:
+                loaded_data[key_name] = fpath
+                artifact_versions[key_name] = ver_label
         except Exception:
             raise FileNotFoundError(
                 f"Missing required artifact for stage '{stage_desc}'. "
@@ -662,12 +663,28 @@ class ReportAgent(BaseAgent):
             raise RuntimeError(f"WeasyPrint PDF rendering failed: {exc}") from exc
 
         # Step 4: Save report_v{N}.pdf versioned artifact
+        version = get_next_version(artifacts_dir, "report")
         report_artifact_path = save_artifact(
             pdf_bytes,
             artifacts_dir,
             "report",
             "pdf",
+            version=version,
+            is_binary=True,
         )
+
+        pdf_path = None
+        try:
+            if isinstance(artifacts_dir, str) and (
+                "/" in artifacts_dir or "\\" in artifacts_dir or os.path.exists(artifacts_dir)
+            ):
+                os.makedirs(artifacts_dir, exist_ok=True)
+                local_pdf = os.path.join(artifacts_dir, f"report_v{version}.pdf")
+                with open(local_pdf, "wb") as f:
+                    f.write(pdf_bytes)
+                pdf_path = os.path.abspath(local_pdf)
+        except Exception:
+            pass
 
         total_duration = time.perf_counter() - start_agent_time
 
@@ -688,7 +705,8 @@ class ReportAgent(BaseAgent):
         )
 
         # Step 6: Update state
-        state["report_pdf_path"] = report_artifact_path
+        state["report_pdf_bytes"] = pdf_bytes
+        state["report_pdf_path"] = pdf_path or f"report_v{version}.pdf"
         state["report_html"] = html_content
         state["report_pdf_bytes_length"] = len(pdf_bytes)
         state["report_versions_used"] = artifact_versions

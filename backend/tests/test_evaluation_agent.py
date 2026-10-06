@@ -335,8 +335,8 @@ class TestEvaluationAgent:
 
         fe_csv_path = get_latest_version_path(artifacts_dir, "feature_engineered", "csv")
         cleaned_csv_path = get_latest_version_path(artifacts_dir, "cleaned", "csv")
-        X = pd.read_csv(fe_csv_path)
-        cleaned_df = pd.read_csv(cleaned_csv_path)
+        X = fe_csv_path if isinstance(fe_csv_path, pd.DataFrame) else pd.read_csv(fe_csv_path)
+        cleaned_df = cleaned_csv_path if isinstance(cleaned_csv_path, pd.DataFrame) else pd.read_csv(cleaned_csv_path)
         y = cleaned_df["Survived"]
 
         # Original Week 5 split
@@ -396,12 +396,9 @@ class TestEvaluationAgent:
         TrainingAgent().run(state)
         EvaluationAgent().run(state)
 
-        # Verify evaluation_bundle_v1.json exists
-        bundle_path = os.path.join(artifacts_dir, "evaluation_bundle_v1.json")
-        assert os.path.exists(bundle_path)
-
-        with open(bundle_path, "r") as f:
-            bundle = json.load(f)
+        # Verify evaluation_bundle artifact exists via DB
+        bundle = get_latest_version_path(artifacts_dir, "evaluation_bundle", "json")
+        assert bundle is not None
 
         expected_keys = {
             "winning_model_name",

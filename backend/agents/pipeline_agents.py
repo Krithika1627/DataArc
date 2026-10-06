@@ -138,7 +138,16 @@ class CleaningAgent(BaseAgent):
             artifacts_dir=artifacts_dir,
         )
 
-        cleaned_df = pd.read_csv(result["artifact_path"])
+        cleaned_df = result.get("cleaned_df")
+        if cleaned_df is None:
+            if isinstance(result.get("artifact_path"), str) and os.path.exists(result["artifact_path"]):
+                cleaned_df = pd.read_csv(result["artifact_path"])
+            else:
+                try:
+                    from agents.versioning_utils import get_latest_artifact
+                except ImportError:
+                    from versioning_utils import get_latest_artifact
+                cleaned_df = get_latest_artifact(artifacts_dir, "cleaned")
 
         state["cleaned_df"] = cleaned_df
         state["cleaning_artifact_path"] = result["artifact_path"]
@@ -157,9 +166,18 @@ class EDAAgent(BaseAgent):
 
         cleaning_changelog = None
         changelog_path = state.get("cleaning_changelog_path")
-        if changelog_path and os.path.exists(changelog_path):
-            with open(changelog_path, "r") as f:
-                cleaning_changelog = json.load(f)
+        if changelog_path and os.path.exists(str(changelog_path)):
+            try:
+                with open(changelog_path, "r") as f:
+                    cleaning_changelog = json.load(f)
+            except Exception:
+                pass
+        if cleaning_changelog is None:
+            try:
+                from agents.versioning_utils import get_latest_artifact
+                cleaning_changelog = get_latest_artifact(artifacts_dir, "cleaned_changelog")
+            except Exception:
+                pass
 
         eda_result = run_eda(
             cleaned_df,
@@ -184,20 +202,29 @@ class FeatureEngineeringAgent(BaseAgent):
 
         high_missing_cols: list[str] = []
         changelog_path = state.get("cleaning_changelog_path")
-        if changelog_path and os.path.exists(changelog_path):
+        cl = None
+        if changelog_path and os.path.exists(str(changelog_path)):
             try:
                 with open(changelog_path, "r") as f:
                     cl = json.load(f)
-                flagged = cl.get("missing_value_imputation", {}).get(
-                    "columns_flagged_high_missing", []
-                )
-                for item in flagged:
-                    if isinstance(item, dict) and "column" in item:
-                        high_missing_cols.append(item["column"])
-                    elif isinstance(item, str):
-                        high_missing_cols.append(item)
             except Exception:
                 pass
+        if cl is None:
+            try:
+                from agents.versioning_utils import get_latest_artifact
+                cl = get_latest_artifact(artifacts_dir, "cleaned_changelog")
+            except Exception:
+                pass
+
+        if cl and isinstance(cl, dict):
+            flagged = cl.get("missing_value_imputation", {}).get(
+                "columns_flagged_high_missing", []
+            )
+            for item in flagged:
+                if isinstance(item, dict) and "column" in item:
+                    high_missing_cols.append(item["column"])
+                elif isinstance(item, str):
+                    high_missing_cols.append(item)
 
         fe_result = build_feature_pipeline(
             cleaned_df,
@@ -255,10 +282,14 @@ class FeatureEngineeringAgent(BaseAgent):
         )
 
         import pickle
-        pkl_name = f"pipeline_v{version}.pkl"
-        pkl_path = os.path.join(artifacts_dir, pkl_name)
-        with open(pkl_path, "wb") as f:
-            pickle.dump(fe_result["pipeline"], f)
+        try:
+            os.makedirs(artifacts_dir, exist_ok=True)
+            pkl_name = f"pipeline_v{version}.pkl"
+            pkl_path = os.path.join(artifacts_dir, pkl_name)
+            with open(pkl_path, "wb") as f:
+                pickle.dump(fe_result["pipeline"], f)
+        except Exception:
+            pkl_path = f"pipeline_v{version}.pkl"
 
         state["feature_engineering_result"] = fe_result
         state["feature_engineered_artifact_path"] = csv_path

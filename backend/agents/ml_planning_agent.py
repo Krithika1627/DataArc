@@ -120,19 +120,34 @@ def _build_planning_summary(
 def load_planning_inputs(artifacts_dir: str) -> dict[str, Any]:
     if not artifacts_dir or not str(artifacts_dir).strip():
         raise ValueError("artifacts_dir must be provided and non-empty.")
-    profile_path = get_latest_version_path(artifacts_dir, "dataset_profile", "json")
-    cleaning_path = get_latest_version_path(artifacts_dir, "cleaned", "json")  # the changelog
-    eda_path = get_latest_version_path(artifacts_dir, "eda_bundle", "json")
-    fe_path = get_latest_version_path(artifacts_dir, "feature_engineered", "json")
+    profile_raw = get_latest_version_path(artifacts_dir, "dataset_profile", "json")
+    try:
+        cleaning_raw = get_latest_version_path(artifacts_dir, "cleaned_changelog", "json")
+    except Exception:
+        try:
+            cleaning_raw = get_latest_version_path(artifacts_dir, "cleaned", "json")
+        except Exception:
+            cleaning_raw = {}
+    eda_raw = get_latest_version_path(artifacts_dir, "eda_bundle", "json")
+    fe_raw = get_latest_version_path(artifacts_dir, "feature_engineered", "json")
 
-    with open(profile_path) as f:
-        profile = json.load(f)
-    with open(cleaning_path) as f:
-        cleaning = json.load(f)
-    with open(eda_path) as f:
-        eda = json.load(f)
-    with open(fe_path) as f:
-        fe = json.load(f)
+    def _to_dict(val):
+        if isinstance(val, dict):
+            return val
+        if isinstance(val, str) and os.path.exists(val):
+            with open(val) as f:
+                return json.load(f)
+        if isinstance(val, str):
+            try:
+                return json.loads(val)
+            except Exception:
+                return {}
+        return val or {}
+
+    profile = _to_dict(profile_raw)
+    cleaning = _to_dict(cleaning_raw)
+    eda = _to_dict(eda_raw)
+    fe = _to_dict(fe_raw)
 
     return _build_planning_summary(profile, cleaning, eda, fe)
 

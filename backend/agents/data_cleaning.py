@@ -40,13 +40,24 @@ def save_versioned_artifact(
     artifacts_dir: str,
     version: int | None = None,
 ) -> str:
-    """Save a DataFrame as a versioned CSV file inside the artifacts directory"""
+    """Save a DataFrame as a versioned CSV artifact into DB (and disk if directory available)"""
     try:
-        from agents.versioning_utils import save_artifact
+        from agents.versioning_utils import save_artifact, get_next_version
     except ImportError:
-        from versioning_utils import save_artifact
+        from versioning_utils import save_artifact, get_next_version
 
-    return save_artifact(df, artifacts_dir, stage_name, "csv", version=version)
+    if version is None:
+        version = get_next_version(artifacts_dir, stage_name)
+
+    save_artifact(df, artifacts_dir, stage_name, "csv", version=version)
+
+    try:
+        os.makedirs(artifacts_dir, exist_ok=True)
+        csv_path = os.path.join(artifacts_dir, f"{stage_name}_v{version}.csv")
+        df.to_csv(csv_path, index=False)
+        return os.path.abspath(csv_path)
+    except Exception:
+        return f"{stage_name}_v{version}.csv"
 
 
 class _CleaningExplanationResponse(TypedDict):
@@ -549,9 +560,9 @@ def clean_dataset(
     explanation = generate_cleaning_explanation(combined_summary)
 
     try:
-        from agents.versioning_utils import get_next_version
+        from agents.versioning_utils import get_next_version, save_artifact
     except ImportError:
-        from versioning_utils import get_next_version
+        from versioning_utils import get_next_version, save_artifact
 
     version = get_next_version(artifacts_dir, "cleaned")
 
@@ -559,18 +570,31 @@ def clean_dataset(
         cleaned_df, "cleaned", artifacts_dir=artifacts_dir, version=version,
     )
 
-    os.makedirs(artifacts_dir, exist_ok=True)
-    changelog_name = f"cleaned_v{version}_changelog.json"
-    changelog_path = os.path.join(artifacts_dir, changelog_name)
-
     changelog_to_save = combined_summary.copy()
     changelog_to_save["llm_explanation"] = explanation
-    with open(changelog_path, "w") as f:
-        json.dump(changelog_to_save, f, indent=2, default=str)
+
+    try:
+        os.makedirs(artifacts_dir, exist_ok=True)
+        changelog_name = f"cleaned_v{version}_changelog.json"
+        changelog_path = os.path.join(artifacts_dir, changelog_name)
+        with open(changelog_path, "w") as f:
+            json.dump(changelog_to_save, f, indent=2, default=str)
+        abs_changelog_path = os.path.abspath(changelog_path)
+    except Exception:
+        abs_changelog_path = f"cleaned_v{version}_changelog.json"
+
+    save_artifact(
+        changelog_to_save,
+        artifacts_dir,
+        "cleaned_changelog",
+        "json",
+        version=version,
+    )
 
     return {
         "artifact_path": artifact_path,
-        "changelog_path": os.path.abspath(changelog_path),
+        "cleaned_df": cleaned_df,
+        "changelog_path": abs_changelog_path,
         "summary": combined_summary,
         "explanation": explanation,
     }

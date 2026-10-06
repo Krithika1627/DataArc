@@ -8,9 +8,10 @@ import time
 from typing import Any, Optional
 
 import pandas as pd
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Body
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Body, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import text
 from agents.dataset_understanding import (
     classify_problem_type,
     compute_confidence_score,
@@ -42,10 +43,15 @@ def resolve_dataset_artifacts_dir(
     create_if_missing: bool = False,
     explicit_artifacts_dir: Optional[str] = None,
 ) -> tuple[str, str]:
+    from agents.versioning_utils import _clean_dataset_id, get_db_engine
     if explicit_artifacts_dir:
-        clean_id = str(dataset_id).strip() if dataset_id else os.path.basename(explicit_artifacts_dir)
-        os.makedirs(explicit_artifacts_dir, exist_ok=True)
-        return clean_id, os.path.abspath(explicit_artifacts_dir)
+        clean_id = str(dataset_id).strip() if dataset_id else _clean_dataset_id(explicit_artifacts_dir)
+        try:
+            os.makedirs(explicit_artifacts_dir, exist_ok=True)
+            target_path = os.path.abspath(explicit_artifacts_dir)
+        except Exception:
+            target_path = explicit_artifacts_dir
+        return clean_id, target_path
 
     if not dataset_id or not str(dataset_id).strip():
         if create_if_missing:
@@ -56,17 +62,29 @@ def resolve_dataset_artifacts_dir(
                 detail="dataset_id is required.",
             )
     else:
-        clean_id = str(dataset_id).strip()
+        clean_id = _clean_dataset_id(dataset_id)
 
     target_dir = os.path.join(BASE_ARTIFACTS_DIR, clean_id)
-    if not create_if_missing and not os.path.exists(target_dir):
-        raise HTTPException(
-            status_code=404,
-            detail=f"Dataset artifacts directory not found for dataset_id='{clean_id}'. Has the dataset been uploaded or analyzed?",
-        )
+    if not create_if_missing:
+        eng = get_db_engine()
+        with eng.connect() as conn:
+            cnt = conn.execute(
+                text("SELECT COUNT(*) FROM artifacts WHERE dataset_id = :d"),
+                {"d": clean_id},
+            ).scalar()
+        if (cnt or 0) == 0 and not os.path.exists(target_dir):
+            raise HTTPException(
+                status_code=404,
+                detail=f"Dataset artifacts not found for dataset_id='{clean_id}'. Has the dataset been uploaded or analyzed?",
+            )
 
-    os.makedirs(target_dir, exist_ok=True)
-    return clean_id, os.path.abspath(target_dir)
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+        target_path = os.path.abspath(target_dir)
+    except Exception:
+        target_path = target_dir
+
+    return clean_id, target_path
 
 
 class CleaningSummary(BaseModel):
@@ -284,6 +302,33 @@ app = FastAPI(
     version="0.2.0",
 )
 
+
+@app.on_event("startup")
+async def on_startup():
+    try:
+        from agents.versioning_utils import get_db_engine
+        eng = get_db_engine()
+        with eng.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        logging.info("Successfully connected to Neon / Postgres database.")
+    except Exception as exc:
+        logging.warning("Database connection check on startup: %s", exc)
+
+
+@app.get("/health")
+async def health_endpoint():
+    """Startup and liveness health check testing database connectivity."""
+    try:
+        from agents.versioning_utils import get_db_engine
+        eng = get_db_engine()
+        with eng.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return {"status": "healthy", "database": "connected"}
+    except Exception as exc:
+        logging.error("Health check database failure: %s", exc)
+        return {"status": "unhealthy", "database": f"connection failed: {exc}"}
+
+
 @app.post("/clean-dataset", response_model=CleanDatasetResponse)
 async def clean_dataset_endpoint(
     file: UploadFile = File(...),
@@ -338,8 +383,8 @@ async def clean_dataset_endpoint(
 
     return CleanDatasetResponse(
         dataset_id=clean_id,
-        artifact_path=result["artifact_path"],
-        changelog_path=result["changelog_path"],
+        artifact_path=str(result["artifact_path"]),
+        changelog_path=str(result["changelog_path"]),
         summary=CleaningSummary(
             duplicate_removal=result["summary"]["duplicate_removal"],
             missing_value_imputation=result["summary"]["missing_value_imputation"],
@@ -742,6 +787,9 @@ async def run_feature_engineering_endpoint(
     with open(meta_json_path, "w") as f:
         json.dump(fe_summary, f, indent=2, default=str)
 
+    save_artifact(fe_summary, artifacts_dir, "feature_engineered", "json", version=version)
+    save_artifact(result["transformed_df"], artifacts_dir, "feature_engineered", "csv", version=version)
+
     log_agent_run(
         agent_name="feature_engineering",
         inputs_summary={
@@ -856,6 +904,10 @@ async def apply_collinearity_drop_endpoint(
         json.dump(new_meta, f)
     with open(fe_json_path, "w") as f:
         json.dump(new_meta, f)
+
+    save_artifact(new_meta, artifacts_dir, "feature_engineered", "json", version=next_version)
+    save_artifact(df_dropped, artifacts_dir, "feature_engineered", "csv", version=next_version)
+
 
     collinear_pairs = [
         CollinearPair(**p) for p in orig_meta.get("collinear_pairs", [])
@@ -975,7 +1027,7 @@ async def plan_training_endpoint(
             candidate_models=[
                 CandidateModelResponse(**m) for m in plan["candidate_models"]
             ],
-            artifact_path=result_state.get("ml_plan_artifact_path"),
+            artifact_path=str(result_state.get("ml_plan_artifact_path")) if result_state.get("ml_plan_artifact_path") is not None else None,
         )
     except HTTPException:
         raise
@@ -1132,15 +1184,28 @@ async def generate_report_endpoint(
 
         agent = ReportAgent()
         result_state = agent.run(state_dict)
-        report_path = result_state.get("report_pdf_path")
-        if not report_path or not os.path.exists(report_path):
+        
+        pdf_bytes = result_state.get("report_pdf_bytes")
+        if not pdf_bytes:
+            from agents.versioning_utils import get_latest_artifact
+            try:
+                pdf_bytes = get_latest_artifact(clean_id, "report")
+            except Exception:
+                pdf_bytes = None
+
+        if not pdf_bytes:
+            report_path = result_state.get("report_pdf_path")
+            if report_path and os.path.exists(report_path):
+                with open(report_path, "rb") as f:
+                    pdf_bytes = f.read()
+
+        if not pdf_bytes:
             raise ValueError("ReportAgent did not produce a valid PDF report.")
 
-        filename = os.path.basename(report_path)
-        return FileResponse(
-            path=report_path,
+        filename = f"report_{clean_id}.pdf"
+        return Response(
+            content=pdf_bytes,
             media_type="application/pdf",
-            filename=filename,
             headers={"Content-Disposition": f"inline; filename={filename}"},
         )
     except HTTPException:

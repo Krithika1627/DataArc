@@ -115,21 +115,52 @@ def load_training_inputs(artifacts_dir: str) -> dict[str, Any]:
     """Load latest feature-engineered dataset, metadata, cleaned target, and ML plan from artifacts."""
     if not artifacts_dir or not str(artifacts_dir).strip():
         raise ValueError("artifacts_dir must be provided and non-empty.")
-    fe_csv_path = get_latest_version_path(
+
+    fe_csv_raw = get_latest_version_path(
         artifacts_dir, "feature_engineered", "csv"
     )
-    fe_json_path = get_latest_version_path(
+    if isinstance(fe_csv_raw, pd.DataFrame):
+        X_df = fe_csv_raw
+    elif isinstance(fe_csv_raw, (bytes, str)):
+        if isinstance(fe_csv_raw, str) and os.path.exists(fe_csv_raw):
+            X_df = pd.read_csv(fe_csv_raw)
+        else:
+            buf = io.BytesIO(fe_csv_raw) if isinstance(fe_csv_raw, bytes) else io.StringIO(fe_csv_raw)
+            X_df = pd.read_csv(buf)
+    else:
+        X_df = pd.DataFrame(fe_csv_raw)
+
+    fe_json_raw = get_latest_version_path(
         artifacts_dir, "feature_engineered", "json"
     )
-    ml_plan_path = get_latest_version_path(artifacts_dir, "ml_plan", "json")
-    cleaned_csv_path = get_latest_version_path(artifacts_dir, "cleaned", "csv")
+    if isinstance(fe_json_raw, dict):
+        fe_metadata = fe_json_raw
+    elif isinstance(fe_json_raw, str) and os.path.exists(fe_json_raw):
+        with open(fe_json_raw, "r") as f:
+            fe_metadata = json.load(f)
+    else:
+        fe_metadata = json.loads(fe_json_raw) if isinstance(fe_json_raw, str) else fe_json_raw
 
-    X_df = pd.read_csv(fe_csv_path)
-    with open(fe_json_path, "r") as f:
-        fe_metadata = json.load(f)
-    with open(ml_plan_path, "r") as f:
-        ml_plan = json.load(f)
-    cleaned_df = pd.read_csv(cleaned_csv_path)
+    ml_plan_raw = get_latest_version_path(artifacts_dir, "ml_plan", "json")
+    if isinstance(ml_plan_raw, dict):
+        ml_plan = ml_plan_raw
+    elif isinstance(ml_plan_raw, str) and os.path.exists(ml_plan_raw):
+        with open(ml_plan_raw, "r") as f:
+            ml_plan = json.load(f)
+    else:
+        ml_plan = json.loads(ml_plan_raw) if isinstance(ml_plan_raw, str) else ml_plan_raw
+
+    cleaned_raw = get_latest_version_path(artifacts_dir, "cleaned", "csv")
+    if isinstance(cleaned_raw, pd.DataFrame):
+        cleaned_df = cleaned_raw
+    elif isinstance(cleaned_raw, (bytes, str)):
+        if isinstance(cleaned_raw, str) and os.path.exists(cleaned_raw):
+            cleaned_df = pd.read_csv(cleaned_raw)
+        else:
+            buf = io.BytesIO(cleaned_raw) if isinstance(cleaned_raw, bytes) else io.StringIO(cleaned_raw)
+            cleaned_df = pd.read_csv(buf)
+    else:
+        cleaned_df = pd.DataFrame(cleaned_raw)
 
     target_column = (
         fe_metadata.get("target_column")
@@ -137,7 +168,7 @@ def load_training_inputs(artifacts_dir: str) -> dict[str, Any]:
     )
     if not target_column or target_column not in cleaned_df.columns:
         raise ValueError(
-            f"Target column '{target_column}' not found in cleaned dataset '{cleaned_csv_path}'."
+            f"Target column '{target_column}' not found in cleaned dataset."
         )
 
     y_series = cleaned_df[target_column]
