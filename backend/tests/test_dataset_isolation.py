@@ -142,8 +142,8 @@ class TestDatasetIsolation:
         assert resp.status_code == 400
         assert "dataset_id is required" in resp.json()["detail"]
 
-        # /train-models
-        resp = client.post("/train-models", json={})
+        # /train-model
+        resp = client.post("/train-model", json={})
         assert resp.status_code == 400
         assert "dataset_id is required" in resp.json()["detail"]
 

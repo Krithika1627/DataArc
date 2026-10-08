@@ -1,4 +1,3 @@
-from __future__ import annotations
 import io
 import json
 import logging
@@ -8,8 +7,12 @@ import time
 from typing import Any, Optional
 
 import pandas as pd
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Body, Response
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Body, Response, Request
 from fastapi.responses import FileResponse
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 from agents.dataset_understanding import (
@@ -29,62 +32,13 @@ from agents.report_agent import ReportAgent
 from agents.logging_utils import log_agent_run
 from agents.versioning_utils import (
     get_dataset_artifacts_dir,
-    get_latest_version_path,
     get_next_version,
+    resolve_dataset_artifacts_dir,
     save_artifact,
 )
 import uuid
 
 BASE_ARTIFACTS_DIR = os.getenv("DATAARC_ARTIFACTS_DIR", "artifacts")
-
-
-def resolve_dataset_artifacts_dir(
-    dataset_id: Optional[str] = None,
-    create_if_missing: bool = False,
-    explicit_artifacts_dir: Optional[str] = None,
-) -> tuple[str, str]:
-    from agents.versioning_utils import _clean_dataset_id, get_db_engine
-    if explicit_artifacts_dir:
-        clean_id = str(dataset_id).strip() if dataset_id else _clean_dataset_id(explicit_artifacts_dir)
-        try:
-            os.makedirs(explicit_artifacts_dir, exist_ok=True)
-            target_path = os.path.abspath(explicit_artifacts_dir)
-        except Exception:
-            target_path = explicit_artifacts_dir
-        return clean_id, target_path
-
-    if not dataset_id or not str(dataset_id).strip():
-        if create_if_missing:
-            clean_id = f"dataset_{uuid.uuid4().hex[:8]}"
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail="dataset_id is required.",
-            )
-    else:
-        clean_id = _clean_dataset_id(dataset_id)
-
-    target_dir = os.path.join(BASE_ARTIFACTS_DIR, clean_id)
-    if not create_if_missing:
-        eng = get_db_engine()
-        with eng.connect() as conn:
-            cnt = conn.execute(
-                text("SELECT COUNT(*) FROM artifacts WHERE dataset_id = :d"),
-                {"d": clean_id},
-            ).scalar()
-        if (cnt or 0) == 0 and not os.path.exists(target_dir):
-            raise HTTPException(
-                status_code=404,
-                detail=f"Dataset artifacts not found for dataset_id='{clean_id}'. Has the dataset been uploaded or analyzed?",
-            )
-
-    try:
-        os.makedirs(target_dir, exist_ok=True)
-        target_path = os.path.abspath(target_dir)
-    except Exception:
-        target_path = target_dir
-
-    return clean_id, target_path
 
 
 class CleaningSummary(BaseModel):
@@ -296,11 +250,16 @@ class EDAResponse(BaseModel):
     )
 
 
+limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
+
 app = FastAPI(
     title="DataArc API",
     description="Autonomous data-scientist pipeline – dataset analysis",
     version="0.2.0",
 )
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
 
 
 @app.on_event("startup")
@@ -330,7 +289,9 @@ async def health_endpoint():
 
 
 @app.post("/clean-dataset", response_model=CleanDatasetResponse)
+@limiter.limit("10/minute")
 async def clean_dataset_endpoint(
+    request: Request,
     file: UploadFile = File(...),
     target_column: Optional[str] = Form(None),
     cap_target: bool = Form(False),
@@ -432,7 +393,9 @@ async def profile_dataset_endpoint(
 
 
 @app.post("/analyze-dataset", response_model=AnalyzeDatasetResponse)
+@limiter.limit("10/minute")
 async def analyze_dataset(
+    request: Request,
     file: UploadFile = File(...),
     user_selected_target: Optional[str] = Form(None),
     dataset_id: Optional[str] = Form(None),
@@ -544,7 +507,9 @@ async def analyze_dataset(
 
 
 @app.post("/run-eda", response_model=EDAResponse)
+@limiter.limit("10/minute")
 async def run_eda_endpoint(
+    request: Request,
     file: UploadFile = File(...),
     target_column: Optional[str] = Form(None),
     problem_type: Optional[str] = Form(None),
@@ -643,7 +608,9 @@ def _next_csv_version_from_path(artifact_path: str) -> int:
 
 
 @app.post("/run-feature-engineering", response_model=FeatureEngineeringResponse)
+@limiter.limit("10/minute")
 async def run_feature_engineering_endpoint(
+    request: Request,
     file: UploadFile = File(...),
     target_column: str = Form(...),
     problem_type: Optional[str] = Form(...),
@@ -995,17 +962,19 @@ class PlanTrainingRequest(BaseModel):
 
 
 @app.post("/plan-ml", response_model=MLPlanResponse)
+@limiter.limit("10/minute")
 async def plan_training_endpoint(
-    request: dict[str, Any] = Body(default_factory=dict),
+    request: Request,
+    payload: dict[str, Any] = Body(default_factory=dict),
 ):
     try:
-        if "state" in request and isinstance(request["state"], dict):
-            state_dict = dict(request["state"])
+        if "state" in payload and isinstance(payload["state"], dict):
+            state_dict = dict(payload["state"])
         else:
-            state_dict = dict(request)
+            state_dict = dict(payload)
 
-        dataset_id = state_dict.get("dataset_id") or request.get("dataset_id")
-        explicit_artifacts_dir = state_dict.get("artifacts_dir") or request.get("artifacts_dir")
+        dataset_id = state_dict.get("dataset_id") or payload.get("dataset_id")
+        explicit_artifacts_dir = state_dict.get("artifacts_dir") or payload.get("artifacts_dir")
         clean_id, artifacts_dir = resolve_dataset_artifacts_dir(
             dataset_id=dataset_id,
             create_if_missing=False,
@@ -1063,20 +1032,20 @@ class TrainModelsResponse(BaseModel):
     artifact_path: str = Field(description="Path to saved training results JSON artifact")
     summary: TrainingSummaryResponse = Field(description="Overall training run summary")
 
-
-@app.post("/train-models", response_model=TrainModelsResponse)
 @app.post("/train-model", response_model=TrainModelsResponse)
+@limiter.limit("10/minute")
 async def train_models_endpoint(
-    request: dict[str, Any] = Body(default_factory=dict),
+    request: Request,
+    payload: dict[str, Any] = Body(default_factory=dict),
 ):
     try:
-        if "state" in request and isinstance(request["state"], dict):
-            state_dict = dict(request["state"])
+        if "state" in payload and isinstance(payload["state"], dict):
+            state_dict = dict(payload["state"])
         else:
-            state_dict = dict(request)
+            state_dict = dict(payload)
 
-        dataset_id = state_dict.get("dataset_id") or request.get("dataset_id")
-        explicit_artifacts_dir = state_dict.get("artifacts_dir") or request.get("artifacts_dir")
+        dataset_id = state_dict.get("dataset_id") or payload.get("dataset_id")
+        explicit_artifacts_dir = state_dict.get("artifacts_dir") or payload.get("artifacts_dir")
         clean_id, artifacts_dir = resolve_dataset_artifacts_dir(
             dataset_id=dataset_id,
             create_if_missing=False,
@@ -1129,17 +1098,19 @@ class EvaluationResponse(BaseModel):
 
 
 @app.post("/evaluate-model", response_model=EvaluationResponse)
+@limiter.limit("10/minute")
 async def evaluate_model_endpoint(
-    request: dict[str, Any] = Body(default_factory=dict),
+    request: Request,
+    payload: dict[str, Any] = Body(default_factory=dict),
 ):
     try:
-        if "state" in request and isinstance(request["state"], dict):
-            state_dict = dict(request["state"])
+        if "state" in payload and isinstance(payload["state"], dict):
+            state_dict = dict(payload["state"])
         else:
-            state_dict = dict(request)
+            state_dict = dict(payload)
 
-        dataset_id = state_dict.get("dataset_id") or request.get("dataset_id")
-        explicit_artifacts_dir = state_dict.get("artifacts_dir") or request.get("artifacts_dir")
+        dataset_id = state_dict.get("dataset_id") or payload.get("dataset_id")
+        explicit_artifacts_dir = state_dict.get("artifacts_dir") or payload.get("artifacts_dir")
         clean_id, artifacts_dir = resolve_dataset_artifacts_dir(
             dataset_id=dataset_id,
             create_if_missing=False,
@@ -1166,17 +1137,19 @@ async def evaluate_model_endpoint(
 
 
 @app.post("/generate-report")
+@limiter.limit("10/minute")
 async def generate_report_endpoint(
-    request: dict[str, Any] = Body(default_factory=dict),
+    request: Request,
+    payload: dict[str, Any] = Body(default_factory=dict),
 ):
     try:
-        if "state" in request and isinstance(request["state"], dict):
-            state_dict = dict(request["state"])
+        if "state" in payload and isinstance(payload["state"], dict):
+            state_dict = dict(payload["state"])
         else:
-            state_dict = dict(request)
+            state_dict = dict(payload)
 
-        dataset_id = state_dict.get("dataset_id") or request.get("dataset_id")
-        explicit_artifacts_dir = state_dict.get("artifacts_dir") or request.get("artifacts_dir")
+        dataset_id = state_dict.get("dataset_id") or payload.get("dataset_id")
+        explicit_artifacts_dir = state_dict.get("artifacts_dir") or payload.get("artifacts_dir")
         clean_id, artifacts_dir = resolve_dataset_artifacts_dir(
             dataset_id=dataset_id,
             create_if_missing=False,

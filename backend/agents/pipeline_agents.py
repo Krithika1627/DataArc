@@ -36,21 +36,22 @@ except ImportError:
 
 
 def _resolve_artifacts_dir(state: dict) -> str:
-    artifacts_dir = state.get("artifacts_dir")
-    if not artifacts_dir:
-        dataset_id = state.get("dataset_id")
-        if not dataset_id:
-            import uuid
-            dataset_id = f"dataset_{uuid.uuid4().hex[:8]}"
-            state["dataset_id"] = dataset_id
-        try:
-            from agents.versioning_utils import get_dataset_artifacts_dir
-        except ImportError:
-            from versioning_utils import get_dataset_artifacts_dir
-        artifacts_dir = get_dataset_artifacts_dir("artifacts", dataset_id)
-    os.makedirs(artifacts_dir, exist_ok=True)
-    state["artifacts_dir"] = artifacts_dir
-    return artifacts_dir
+    try:
+        from agents.versioning_utils import resolve_dataset_artifacts_dir
+    except ImportError:
+        from versioning_utils import resolve_dataset_artifacts_dir
+
+    dataset_id = state.get("dataset_id")
+    explicit_dir = state.get("artifacts_dir")
+    clean_id, target_dir = resolve_dataset_artifacts_dir(
+        dataset_id=dataset_id,
+        base_dir="artifacts",
+        create_if_missing=True,
+        explicit_artifacts_dir=explicit_dir,
+    )
+    state["dataset_id"] = clean_id
+    state["artifacts_dir"] = target_dir
+    return target_dir
 
 
 class DatasetUnderstandingAgent(BaseAgent):

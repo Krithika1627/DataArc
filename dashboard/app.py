@@ -636,11 +636,7 @@ def render_pipeline_results(
             st.info("Model-ready feature-engineered CSV is not available for preview.")
 
 
-
-
-# -----------------------------------------------------------------------------
 # Main Application UI
-# -----------------------------------------------------------------------------
 def main():
     init_session_state()
 
@@ -702,7 +698,7 @@ def main():
 
     # TAB 1: ACTIVE PIPELINE EXECUTION
     with tab_pipeline:
-        # 1. CSV File Upload Section
+        # CSV File Upload Section
         upload_col, info_col = st.columns([2, 1])
 
         with upload_col:
@@ -762,7 +758,7 @@ def main():
             confidence_score_data = analysis.get("confidence_score") or {}
             columns_list = [col["name"] for col in profile.get("columns", [])]
 
-            # 2. Dataset Overview & Target Column Selection
+            # Dataset Overview & Target Column Selection
             st.markdown("---")
             st.subheader("Step 2: Dataset Profile & Target Confirmation")
 
@@ -840,7 +836,7 @@ def main():
                     st.write(f"**Classification Reasoning:** {problem_type_info.get('confidence_reasoning', 'N/A')}")
                     st.write(f"**Project Plan:** {problem_type_info.get('project_plan', 'N/A')}")
 
-            # 3. Pipeline Execution Section
+            # Pipeline Execution Section
             st.markdown("---")
             st.subheader("Step 3: Execute Autonomous Pipeline")
 
@@ -989,7 +985,7 @@ def main():
                         {"stage": "Error", "duration": "0s", "status": "Failed", "summary": str(exc)}
                     )
 
-            # 4. Live Execution Trace Log
+            # Live Execution Trace Log
             if st.session_state["pipeline_logs"]:
                 with st.expander("View Pipeline Execution Trace & Logs", expanded=not st.session_state["pipeline_completed"]):
                     log_df = pd.DataFrame(st.session_state["pipeline_logs"])
@@ -1005,7 +1001,7 @@ def main():
                         hide_index=True,
                     )
 
-            # 5. Interactive Results Walkthrough
+            # Interactive Results Walkthrough
             if st.session_state["pipeline_completed"] and st.session_state["pipeline_results"]:
                 st.markdown("---")
                 render_pipeline_results(
@@ -1037,7 +1033,7 @@ def main():
                     "File Name": r.get("filename") or "-",
                     "Last Updated": r.get("last_updated", "")[:19].replace("T", " "),
                     "Rows": f"{r.get('row_count'):,}" if r.get("row_count") is not None else "-",
-                    "Columns": r.get("column_count") or "-",
+                    "Columns": str(r.get("column_count")) if r.get("column_count") is not None else "-",
                     "Target Column": r.get("target_column") or "-",
                     "Problem Type": (r.get("problem_type") or "-").capitalize(),
                     "Champion Model": r.get("winning_model") or "-",

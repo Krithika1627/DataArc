@@ -150,6 +150,46 @@ def _clean_dataset_id(dataset_id: str) -> str:
     return s
 
 
+import uuid
+
+
+def resolve_dataset_artifacts_dir(
+    dataset_id: Optional[str] = None,
+    base_dir: str = "artifacts",
+    create_if_missing: bool = False,
+    explicit_artifacts_dir: Optional[str] = None,
+) -> tuple[str, str]:
+    """
+    Centralized resolver returning (clean_dataset_id, absolute_artifacts_dir_path).
+    Ensures dataset directory exists and handles legacy/custom directory paths.
+    """
+    if explicit_artifacts_dir:
+        clean_id = str(dataset_id).strip() if dataset_id else _clean_dataset_id(explicit_artifacts_dir)
+        try:
+            os.makedirs(explicit_artifacts_dir, exist_ok=True)
+            target_path = os.path.abspath(explicit_artifacts_dir)
+        except Exception:
+            target_path = explicit_artifacts_dir
+        return clean_id, target_path
+
+    if not dataset_id or not str(dataset_id).strip():
+        if create_if_missing:
+            clean_id = f"dataset_{uuid.uuid4().hex[:8]}"
+        else:
+            raise ValueError("dataset_id is required.")
+    else:
+        clean_id = _clean_dataset_id(dataset_id)
+
+    target_dir = os.path.join(base_dir, clean_id)
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+        target_path = os.path.abspath(target_dir)
+    except Exception:
+        target_path = target_dir
+
+    return clean_id, target_path
+
+
 def get_dataset_artifacts_dir(base_dir: str, dataset_id: str) -> str:
     """Legacy helper returning dataset_id."""
     return _clean_dataset_id(dataset_id)

@@ -381,8 +381,14 @@ REQUIREMENTS:
         )
 
     try:
+        from agents.logging_utils import generate_content_with_retry
+    except ImportError:
+        from logging_utils import generate_content_with_retry
+
+    try:
         client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
+        response = generate_content_with_retry(
+            client=client,
             model="gemini-3.1-flash-lite",
             contents=prompt,
         )

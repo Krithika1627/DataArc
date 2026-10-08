@@ -39,6 +39,7 @@ try:
     from agents.base_agent import BaseAgent
     from agents.logging_utils import log_agent_run
     from agents.versioning_utils import (
+        get_latest_artifact,
         get_latest_version_path,
         get_next_version,
         save_artifact,
@@ -47,6 +48,7 @@ except ImportError:
     from base_agent import BaseAgent
     from logging_utils import log_agent_run
     from versioning_utils import (
+        get_latest_artifact,
         get_latest_version_path,
         get_next_version,
         save_artifact,
@@ -111,56 +113,50 @@ def get_estimator(model_name: str, problem_type: str) -> Any | None:
     return estimator
 
 
+def _to_dataframe(val: Any) -> pd.DataFrame:
+    if isinstance(val, pd.DataFrame):
+        return val
+    if isinstance(val, (bytes, bytearray)):
+        return pd.read_csv(io.BytesIO(bytes(val)))
+    if isinstance(val, str):
+        if os.path.exists(val):
+            return pd.read_csv(val)
+        return pd.read_csv(io.StringIO(val))
+    if isinstance(val, dict):
+        return pd.DataFrame(val)
+    return pd.DataFrame()
+
+
+def _to_dict(val: Any) -> dict:
+    if isinstance(val, dict):
+        return val
+    if isinstance(val, str):
+        if os.path.exists(val):
+            with open(val, "r") as f:
+                return json.load(f)
+        try:
+            return json.loads(val)
+        except Exception:
+            return {}
+    return {}
+
+
 def load_training_inputs(artifacts_dir: str) -> dict[str, Any]:
     """Load latest feature-engineered dataset, metadata, cleaned target, and ML plan from artifacts."""
     if not artifacts_dir or not str(artifacts_dir).strip():
         raise ValueError("artifacts_dir must be provided and non-empty.")
 
-    fe_csv_raw = get_latest_version_path(
-        artifacts_dir, "feature_engineered", "csv"
-    )
-    if isinstance(fe_csv_raw, pd.DataFrame):
-        X_df = fe_csv_raw
-    elif isinstance(fe_csv_raw, (bytes, str)):
-        if isinstance(fe_csv_raw, str) and os.path.exists(fe_csv_raw):
-            X_df = pd.read_csv(fe_csv_raw)
-        else:
-            buf = io.BytesIO(fe_csv_raw) if isinstance(fe_csv_raw, bytes) else io.StringIO(fe_csv_raw)
-            X_df = pd.read_csv(buf)
-    else:
-        X_df = pd.DataFrame(fe_csv_raw)
+    fe_csv_raw = get_latest_artifact(artifacts_dir, "feature_engineered", "csv")
+    X_df = _to_dataframe(fe_csv_raw)
 
-    fe_json_raw = get_latest_version_path(
-        artifacts_dir, "feature_engineered", "json"
-    )
-    if isinstance(fe_json_raw, dict):
-        fe_metadata = fe_json_raw
-    elif isinstance(fe_json_raw, str) and os.path.exists(fe_json_raw):
-        with open(fe_json_raw, "r") as f:
-            fe_metadata = json.load(f)
-    else:
-        fe_metadata = json.loads(fe_json_raw) if isinstance(fe_json_raw, str) else fe_json_raw
+    fe_json_raw = get_latest_artifact(artifacts_dir, "feature_engineered", "json")
+    fe_metadata = _to_dict(fe_json_raw)
 
-    ml_plan_raw = get_latest_version_path(artifacts_dir, "ml_plan", "json")
-    if isinstance(ml_plan_raw, dict):
-        ml_plan = ml_plan_raw
-    elif isinstance(ml_plan_raw, str) and os.path.exists(ml_plan_raw):
-        with open(ml_plan_raw, "r") as f:
-            ml_plan = json.load(f)
-    else:
-        ml_plan = json.loads(ml_plan_raw) if isinstance(ml_plan_raw, str) else ml_plan_raw
+    ml_plan_raw = get_latest_artifact(artifacts_dir, "ml_plan", "json")
+    ml_plan = _to_dict(ml_plan_raw)
 
-    cleaned_raw = get_latest_version_path(artifacts_dir, "cleaned", "csv")
-    if isinstance(cleaned_raw, pd.DataFrame):
-        cleaned_df = cleaned_raw
-    elif isinstance(cleaned_raw, (bytes, str)):
-        if isinstance(cleaned_raw, str) and os.path.exists(cleaned_raw):
-            cleaned_df = pd.read_csv(cleaned_raw)
-        else:
-            buf = io.BytesIO(cleaned_raw) if isinstance(cleaned_raw, bytes) else io.StringIO(cleaned_raw)
-            cleaned_df = pd.read_csv(buf)
-    else:
-        cleaned_df = pd.DataFrame(cleaned_raw)
+    cleaned_raw = get_latest_artifact(artifacts_dir, "cleaned", "csv")
+    cleaned_df = _to_dataframe(cleaned_raw)
 
     target_column = (
         fe_metadata.get("target_column")

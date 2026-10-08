@@ -126,3 +126,26 @@ def with_agent_logging(agent_name: str):
         return wrapper
 
     return decorator
+
+
+from typing import Any
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=2, max=8),
+    reraise=True,
+)
+def generate_content_with_retry(
+    client: Any,
+    model: str,
+    contents: Any,
+    config: Any = None,
+) -> Any:
+    """Invokes Gemini generate_content with 3 retries and exponential backoff (2s, 4s, 8s)."""
+    if config is not None:
+        return client.models.generate_content(
+            model=model, contents=contents, config=config
+        )
+    return client.models.generate_content(model=model, contents=contents)

@@ -196,7 +196,13 @@ def generate_cleaning_explanation(changelog: dict) -> dict:
     prompt = _build_cleaning_prompt(changelog)
 
     try:
-        response = client.models.generate_content(
+        from agents.logging_utils import generate_content_with_retry
+    except ImportError:
+        from logging_utils import generate_content_with_retry
+
+    try:
+        response = generate_content_with_retry(
+            client=client,
             model="gemini-3.1-flash-lite",
             contents=prompt,
             config={
