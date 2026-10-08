@@ -515,9 +515,11 @@ async def analyze_dataset(
         dataset_id=dataset_id, create_if_missing=True
     )
     profile["dataset_id"] = clean_id
+    profile["filename"] = file.filename
 
     saved_profile_payload = {
         "dataset_id": clean_id,
+        "filename": file.filename,
         "profile": profile,
         "target_candidates": target_candidates,
         "target_source": target_source,
@@ -1063,6 +1065,7 @@ class TrainModelsResponse(BaseModel):
 
 
 @app.post("/train-models", response_model=TrainModelsResponse)
+@app.post("/train-model", response_model=TrainModelsResponse)
 async def train_models_endpoint(
     request: dict[str, Any] = Body(default_factory=dict),
 ):
@@ -1091,7 +1094,7 @@ async def train_models_endpoint(
         return TrainModelsResponse(
             dataset_id=clean_id,
             comparison_table=[ModelTrainingResultResponse(**r) for r in results],
-            artifact_path=artifact_path,
+            artifact_path=str(artifact_path),
             summary=TrainingSummaryResponse(**summary),
         )
     except HTTPException:
@@ -1215,6 +1218,93 @@ async def generate_report_endpoint(
             status_code=400,
             detail=str(exc),
         )
+
+
+@app.get("/history")
+async def list_history_endpoint():
+    """Lists all previous dataset runs saved in the database with their summaries."""
+    from agents.versioning_utils import list_all_dataset_runs
+    try:
+        runs = list_all_dataset_runs()
+        return {"runs": runs, "total": len(runs)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve history: {exc}")
+
+
+@app.get("/history/{dataset_id}")
+async def get_history_endpoint(dataset_id: str):
+    """Retrieves all stored artifacts for a given dataset_id."""
+    from agents.versioning_utils import get_dataset_history
+    try:
+        data = get_dataset_history(dataset_id)
+        return data
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=f"Failed to load dataset run: {exc}")
+
+
+@app.get("/report/{dataset_id}")
+async def get_report_pdf_endpoint(dataset_id: str):
+    """Downloads the stored PDF report for a given dataset_id."""
+    from agents.versioning_utils import get_latest_artifact
+    try:
+        pdf_bytes = get_latest_artifact(dataset_id, "report", extension="pdf")
+        if not pdf_bytes:
+            raise FileNotFoundError("PDF report not found")
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"inline; filename=report_{dataset_id}.pdf"},
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=f"Report not found for dataset {dataset_id}: {exc}")
+
+
+@app.get("/artifacts/{dataset_id}/cleaned")
+async def get_cleaned_csv_endpoint(dataset_id: str):
+    """Downloads the cleaned CSV dataset for a given dataset_id."""
+    from agents.versioning_utils import get_latest_artifact
+    try:
+        data = get_latest_artifact(dataset_id, "cleaned", extension="csv")
+        if isinstance(data, pd.DataFrame):
+            csv_content = data.to_csv(index=False)
+        elif isinstance(data, bytes):
+            csv_content = data.decode("utf-8")
+        elif isinstance(data, str):
+            csv_content = data
+        else:
+            raise FileNotFoundError("Cleaned dataset not found as tabular data")
+        return Response(
+            content=csv_content,
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={dataset_id}_cleaned.csv"},
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=f"Cleaned dataset not found for dataset {dataset_id}: {exc}")
+
+
+@app.get("/artifacts/{dataset_id}/feature-engineered")
+async def get_feature_engineered_csv_endpoint(dataset_id: str):
+    """Downloads the model-ready feature-engineered CSV dataset for a given dataset_id."""
+    from agents.versioning_utils import get_latest_artifact
+    try:
+        data = get_latest_artifact(dataset_id, "feature_engineered", extension="csv")
+        if isinstance(data, pd.DataFrame):
+            csv_content = data.to_csv(index=False)
+        elif isinstance(data, bytes):
+            csv_content = data.decode("utf-8")
+        elif isinstance(data, str):
+            csv_content = data
+        else:
+            raise FileNotFoundError("Feature-engineered dataset not found as tabular data")
+        return Response(
+            content=csv_content,
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={dataset_id}_feature_engineered.csv"},
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=f"Feature-engineered dataset not found for dataset {dataset_id}: {exc}")
+
+
 
 
 

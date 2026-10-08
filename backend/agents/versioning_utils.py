@@ -201,6 +201,30 @@ def get_next_version(dataset_id: str, artifact_type: str) -> int:
         return int(val or 1)
 
 
+import math
+import numpy as np
+
+
+def _sanitize_for_json(obj: Any) -> Any:
+    """Recursively converts NaN, Inf, and numpy types to JSON-safe primitives (null, int, float)."""
+    if obj is None:
+        return None
+    if isinstance(obj, (float, np.floating)):
+        val = float(obj)
+        if math.isnan(val) or math.isinf(val):
+            return None
+        return val
+    if isinstance(obj, (int, np.integer)):
+        return int(obj)
+    if isinstance(obj, (bool, np.bool_)):
+        return bool(obj)
+    if isinstance(obj, dict):
+        return {str(k): _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_sanitize_for_json(item) for item in obj]
+    return obj
+
+
 def save_artifact(
     data: Any,
     dataset_id: str,
@@ -239,17 +263,19 @@ def save_artifact(
         }
     elif isinstance(data, (dict, list)):
         content_type = "json"
-        content_json = data
+        content_json = _sanitize_for_json(data)
     elif isinstance(data, str):
         try:
-            content_json = json.loads(data)
+            parsed = json.loads(data)
+            content_json = _sanitize_for_json(parsed)
             content_type = "json"
         except Exception:
             content_type = "binary"
             content_binary = data.encode("utf-8")
     else:
         try:
-            content_json = json.loads(json.dumps(data, default=str))
+            parsed = json.loads(json.dumps(data, default=str))
+            content_json = _sanitize_for_json(parsed)
             content_type = "json"
         except Exception:
             content_type = "binary"
@@ -258,7 +284,7 @@ def save_artifact(
     with eng.connect() as conn:
         with conn.begin():
             if eng.dialect.name == "postgresql":
-                json_val = json.dumps(content_json, default=str) if content_json is not None else None
+                json_val = json.dumps(_sanitize_for_json(content_json), default=str) if content_json is not None else None
                 stmt = text(
                     """
                     INSERT INTO artifacts (dataset_id, artifact_type, version, content_json, content_binary, content_type)
@@ -279,7 +305,7 @@ def save_artifact(
                     },
                 )
             else:
-                json_val = json.dumps(content_json, default=str) if content_json is not None else None
+                json_val = json.dumps(_sanitize_for_json(content_json), default=str) if content_json is not None else None
                 stmt = text(
                     """
                     INSERT OR REPLACE INTO artifacts (dataset_id, artifact_type, version, content_json, content_binary, content_type)
@@ -297,6 +323,7 @@ def save_artifact(
                         "content_type": content_type,
                     },
                 )
+
 
     # Optional local file system mirroring for backwards compatibility with legacy file assertions
     try:
@@ -395,3 +422,145 @@ def get_latest_version_path(
 ) -> Any:
     """Wrapper around get_latest_artifact for compatibility with previous call sites."""
     return get_latest_artifact(dataset_id, artifact_type, extension=extension)
+
+
+def list_all_dataset_runs() -> list[dict[str, Any]]:
+    """Returns a list of all distinct dataset runs saved in the database with summary info."""
+    eng = get_db_engine()
+    runs_map: dict[str, dict[str, Any]] = {}
+
+    with eng.connect() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT dataset_id, artifact_type, version, created_at,
+                       CASE WHEN artifact_type IN ('dataset_profile', 'profile', 'evaluation_summary', 'evaluation_bundle', 'feature_engineered', 'feature_engineering', 'ml_plan', 'report') 
+                            THEN content_json ELSE NULL END AS content_json,
+                       content_type
+                FROM artifacts
+                ORDER BY created_at DESC
+                """
+            )
+        ).fetchall()
+
+        for row in rows:
+            d_id, art_type, ver, created, content_json, c_type = row
+            if d_id not in runs_map:
+                runs_map[d_id] = {
+                    "dataset_id": d_id,
+                    "filename": None,
+                    "first_created": str(created),
+                    "last_updated": str(created),
+                    "artifacts": set(),
+                    "row_count": None,
+                    "column_count": None,
+                    "target_column": None,
+                    "problem_type": None,
+                    "winning_model": None,
+                    "winning_score": None,
+                    "recommended_metric": None,
+                    "has_report": False,
+                }
+
+            run = runs_map[d_id]
+            run["artifacts"].add(art_type)
+            run["last_updated"] = str(created)
+
+            # Parse metadata
+            if art_type == "report":
+                run["has_report"] = True
+
+            parsed_json = content_json
+            if isinstance(parsed_json, str):
+                try:
+                    parsed_json = json.loads(parsed_json)
+                except Exception:
+                    parsed_json = None
+
+            if isinstance(parsed_json, dict):
+                if not run["filename"]:
+                    run["filename"] = parsed_json.get("filename")
+                if art_type in ("dataset_profile", "profile"):
+                    profile_obj = parsed_json.get("profile") or parsed_json
+                    if isinstance(profile_obj, dict):
+                        run["row_count"] = profile_obj.get("row_count")
+                        run["column_count"] = profile_obj.get("column_count")
+                        if not run["filename"]:
+                            run["filename"] = profile_obj.get("filename")
+                    if not run["target_column"]:
+                        run["target_column"] = parsed_json.get("selected_target") or parsed_json.get("target_column")
+                    if not run["problem_type"]:
+                        analysis = parsed_json.get("problem_type_analysis")
+                        if isinstance(analysis, dict):
+                            run["problem_type"] = analysis.get("problem_type")
+                elif art_type in ("evaluation_summary", "evaluation_bundle"):
+                    run["winning_model"] = parsed_json.get("winning_model_name")
+                    run["winning_score"] = parsed_json.get("winning_score")
+                    run["recommended_metric"] = parsed_json.get("recommended_metric")
+                    if not run["problem_type"]:
+                        run["problem_type"] = parsed_json.get("problem_type")
+                    if not run["target_column"]:
+                        run["target_column"] = parsed_json.get("target_column")
+                elif art_type in ("feature_engineered", "feature_engineering"):
+                    if not run["target_column"]:
+                        run["target_column"] = parsed_json.get("target_column")
+                    if not run["problem_type"]:
+                        run["problem_type"] = parsed_json.get("problem_type")
+                elif art_type == "ml_plan":
+                    if not run["target_column"]:
+                        run["target_column"] = parsed_json.get("selected_target") or parsed_json.get("target_column")
+                    if not run["problem_type"]:
+                        run["problem_type"] = parsed_json.get("problem_type")
+                elif art_type == "report":
+                    meta = parsed_json.get("metadata") or {}
+                    if isinstance(meta, dict):
+                        if not run["target_column"]:
+                            run["target_column"] = meta.get("target_column")
+                        if not run["problem_type"]:
+                            run["problem_type"] = meta.get("problem_type")
+                        if not run["filename"]:
+                            run["filename"] = meta.get("filename")
+
+    result = []
+    for d_id, data in runs_map.items():
+        data["artifacts"] = sorted(list(data["artifacts"]))
+        result.append(data)
+
+    return result
+
+
+def get_dataset_history(dataset_id: str) -> dict[str, Any]:
+    """Retrieves all available stage artifacts for a given dataset_id."""
+    clean_id = _clean_dataset_id(dataset_id)
+    history: dict[str, Any] = {"dataset_id": clean_id}
+
+    stage_types = {
+        "profile": [("dataset_profile", "json"), ("profile", "json")],
+        "cleaning": [("cleaned_changelog", "json"), ("cleaned", "json")],
+        "eda": [("eda_bundle", "json"), ("eda_insights", "json")],
+        "feature_engineering": [("feature_pipeline", "json"), ("feature_engineered", "json")],
+        "ml_plan": [("ml_plan", "json")],
+        "training": [("training_results", "json"), ("training_summary", "json")],
+        "evaluation": [("evaluation_bundle", "json"), ("evaluation_summary", "json")],
+    }
+
+    for key, type_candidates in stage_types.items():
+        val = None
+        for art_type, ext in type_candidates:
+            try:
+                val = get_latest_artifact(clean_id, art_type, extension=ext)
+                if val:
+                    break
+            except Exception:
+                continue
+        history[key] = val
+
+    try:
+        pdf_bytes = get_latest_artifact(clean_id, "report", extension="pdf")
+        history["has_report"] = bool(pdf_bytes)
+    except Exception:
+        history["has_report"] = False
+
+    return history
+
+
